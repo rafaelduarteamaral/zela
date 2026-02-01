@@ -1,0 +1,39 @@
+name = "financezap"
+main = "src/worker.ts"
+compatibility_date = "2025-02-01"
+compatibility_flags = ["nodejs_compat"]
+tsconfig = "tsconfig.worker.json"
+
+# Habilitar workers.dev subdomain (gratuito)
+workers_dev = true
+
+[[d1_databases]]
+binding = "financezap_db"
+database_name = "financezap-db"
+database_id = "ebba7132-e0c2-448a-a553-2540fb8356a5"
+migrations_dir = "prisma/migrations"
+
+[vars]
+# Ajuste as origens permitidas do frontend (separadas por vírgula)
+# URLs permitidas para CORS
+ALLOWED_ORIGINS = "https://usezela.com,https://www.usezela.com,https://*.usezela.com,https://financezap-frontend.pages.dev,https://*.financezap-frontend.pages.dev,http://localhost:5173,http://localhost:3000"
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
+
+# Cron Triggers - Notificações automáticas de agendamentos
+# Executa diariamente às 8h (horário UTC)
+[triggers]
+crons = ["0 8 * * *"]

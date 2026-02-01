@@ -1,0 +1,2831 @@
+// Utilidades para acessar o D1 no Cloudflare Workers (substitui Prisma no Worker)
+
+// Interface para D1Database (compatível com Cloudflare Workers)
+export interface D1Database {
+  prepare(query: string): D1PreparedStatement;
+  exec?(query: string): Promise<D1ExecResult>;
+}
+
+interface D1PreparedStatement {
+  bind(...values: any[]): D1PreparedStatement;
+  first<T = any>(colName?: string): Promise<T | null>;
+  run(): Promise<D1Result>;
+  all<T = any>(): Promise<D1Result<T>>;
+}
+
+interface D1Result<T = any> {
+  results: T[];
+  success: boolean;
+  meta: {
+    duration: number;
+    rows_read: number;
+    rows_written: number;
+    last_row_id: number;
+    changed_db: boolean;
+    changes: number;
+  };
+}
+
+interface D1ExecResult {
+  count: number;
+  duration: number;
+}
+
+export interface NotificacaoRecord {
+  id?: number;
+  telefone: string;
+  tipo: string; // 'transacao-nova', 'categoria-removida', etc.
+  dados: string; // JSON string
+  lida: number; // 0 = não lida, 1 = lida
+  criadoEm: string;
+}
+
+export interface TransacaoRecord {
+  id?: number;
+  telefone: string;
+  descricao: string;
+  valor: number;
+  categoria: string;
+  tipo: 'entrada' | 'saida';
+  metodo: 'credito' | 'debito';
+  dataHora: string;
+  data: string;
+  mensagemOriginal?: string | null;
+  carteiraId?: number | null;
+  carteira?: {
+    id: number;
+    nome: string;
+    tipo?: string;
+  } | null;
+}
+
+export interface TransacoesResultado {
+  transacoes: TransacaoRecord[];
+  total: number;
+}
+
+export interface Estatisticas {
+  totalEntradas: number;
+  totalSaidas: number;
+  saldo: number;
+  totalTransacoes: number;
+  mediaGasto: number;
+  maiorGasto: number;
+  menorGasto: number;
+  gastoHoje: number;
+  gastoMes: number;
+}
+
+function normalizarTelefone(telefone: string): string {
+  return telefone.replace('whatsapp:', '').trim();
+}
+
+// Função para criar variações de números brasileiros com dígito 9 opcional
+function criarVariacoesDigito9(numero: string): string[] {
+  const variacoes: string[] = [numero];
+  
+  // Remove caracteres não numéricos
+  const apenasNumeros = numero.replace(/\D/g, '');
+  
+  // Se começa com 55 (código do Brasil)
+  if (apenasNumeros.startsWith('55')) {
+    const resto = apenasNumeros.substring(2); // Remove o 55
+    
+    // Se tem mais de 10 dígitos após o 55, pode ter o 9 opcional
+    if (resto.length >= 10) {
+      // Tenta adicionar/remover o 9 após o DDD (após os 2 primeiros dígitos do resto)
+      const ddd = resto.substring(0, 2);
+      const numeroSemDDD = resto.substring(2);
+      
+      // Se o número começa com 9, cria variação sem o 9
+      if (numeroSemDDD.startsWith('9') && numeroSemDDD.length === 9) {
+        const sem9 = `55${ddd}${numeroSemDDD.substring(1)}`;
+        variacoes.push(sem9);
+        variacoes.push(`+${sem9}`);
+        variacoes.push(`whatsapp:+${sem9}`);
+      }
+      
+      // Se o número não começa com 9 mas tem 8 dígitos, cria variação com 9
+      if (!numeroSemDDD.startsWith('9') && numeroSemDDD.length === 8) {
+        const com9 = `55${ddd}9${numeroSemDDD}`;
+        variacoes.push(com9);
+        variacoes.push(`+${com9}`);
+        variacoes.push(`whatsapp:+${com9}`);
+      }
+    }
+  }
+  
+  return variacoes;
+}
+
+function telefoneVariacoes(telefone: string): string[] {
+  const limpo = normalizarTelefone(telefone);
+  const semMais = limpo.replace(/^\+/, '');
+  const comMais = `+${semMais}`;
+  const comPrefixoWhats = `whatsapp:${comMais}`;
+  const semPrefixoComMais = limpo; // Mantém o formato original normalizado
+  
+  // Cria variações básicas
+  const variacoesBasicas = [
+    limpo,           // +5511999999999
+    semMais,         // 5511999999999
+    comMais,         // +5511999999999
+    comPrefixoWhats, // whatsapp:+5511999999999
+  ];
+  
+  // Cria variações com/sem dígito 9 opcional (para números brasileiros)
+  const variacoesDigito9 = criarVariacoesDigito9(semMais);
+  
+  // Combina todas as variações
+  const todasVariacoes = [
+    ...variacoesBasicas,
+    ...variacoesDigito9,
+    semPrefixoComMais
+  ];
+  
+  const unicas = [...new Set(todasVariacoes)].filter(Boolean);
+  console.log('🔍 telefoneVariacoes para', telefone, '->', unicas.length, 'variações');
+  return unicas;
+}
+
+// Normaliza nomes de carteira para comparação (minúsculas, sem acentos, sem pontuação)
+function normalizarTextoCarteira(texto: string): string {
+  return (texto || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9\\s]/g, ' ')
+    .replace(/\\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+// Distância de Levenshtein simples para pontuar similaridade
+function distanciaLevenshtein(a: string, b: string): number {
+  const s = normalizarTextoCarteira(a);
+  const t = normalizarTextoCarteira(b);
+  if (s === t) return 0;
+  if (s.length === 0) return t.length;
+  if (t.length === 0) return s.length;
+
+  const matrix: number[][] = Array.from({ length: s.length + 1 }, () => new Array(t.length + 1).fill(0));
+  for (let i = 0; i <= s.length; i++) matrix[i][0] = i;
+  for (let j = 0; j <= t.length; j++) matrix[0][j] = j;
+
+  for (let i = 1; i <= s.length; i++) {
+    for (let j = 1; j <= t.length; j++) {
+      const custo = s[i - 1] === t[j - 1] ? 0 : 1;
+      matrix[i][j] = Math.min(
+        matrix[i - 1][j] + 1,        // remoção
+        matrix[i][j - 1] + 1,        // inserção
+        matrix[i - 1][j - 1] + custo // substituição
+      );
+    }
+  }
+
+  return matrix[s.length][t.length];
+}
+
+// Retorna score de similaridade 0..1 (1 = igual). Inclui bônus se substring.
+function scoreSemelhancaCarteira(a: string, b: string): number {
+  const normA = normalizarTextoCarteira(a);
+  const normB = normalizarTextoCarteira(b);
+  if (!normA || !normB) return 0;
+  if (normA === normB) return 1;
+
+  const dist = distanciaLevenshtein(normA, normB);
+  const maxLen = Math.max(normA.length, normB.length);
+  const base = 1 - dist / maxLen;
+  const substringBonus = normA.includes(normB) || normB.includes(normA) ? 0.15 : 0;
+  return Math.min(1, Math.max(0, base + substringBonus));
+}
+
+function montarWhere(filtros: {
+  telefone?: string;
+  dataInicio?: string;
+  dataFim?: string;
+  valorMin?: number;
+  valorMax?: number;
+  descricao?: string;
+  categoria?: string;
+}) {
+  const where: string[] = [];
+  const params: Array<string | number> = [];
+
+  if (filtros.telefone) {
+    const variacoes = telefoneVariacoes(filtros.telefone);
+    console.log('🔍 Montando WHERE com variações:', variacoes);
+    
+    // Também cria variações normalizadas (sem whatsapp: e sem +)
+    const variacoesNormalizadas = variacoes.map(v => normalizarTelefone(v));
+    const todasVariacoes = [...new Set([...variacoes, ...variacoesNormalizadas])];
+    console.log('🔍 Todas as variações (incluindo normalizadas):', todasVariacoes);
+    console.log('🔍 Quantidade de variações:', todasVariacoes.length);
+    
+    if (todasVariacoes.length === 0) {
+      console.warn('⚠️ Nenhuma variação criada para o telefone:', filtros.telefone);
+    }
+    
+    const placeholders = todasVariacoes.map(() => 'telefone = ?').join(' OR ');
+    where.push(`(${placeholders})`);
+    params.push(...todasVariacoes);
+    
+    console.log('🔍 SQL WHERE clause gerado:', `(${placeholders})`);
+    console.log('🔍 SQL params:', params.slice(0, 10)); // Mostra apenas os primeiros 10 params
+  }
+
+  if (filtros.dataInicio) {
+    where.push('date(data) >= date(?)');
+    params.push(filtros.dataInicio.split('T')[0]);
+  }
+
+  if (filtros.dataFim) {
+    where.push('date(data) <= date(?)');
+    params.push(filtros.dataFim.split('T')[0]);
+  }
+
+  if (filtros.valorMin !== undefined) {
+    where.push('valor >= ?');
+    params.push(filtros.valorMin);
+  }
+
+  if (filtros.valorMax !== undefined) {
+    where.push('valor <= ?');
+    params.push(filtros.valorMax);
+  }
+
+  if (filtros.descricao) {
+    where.push('descricao LIKE ?');
+    params.push(`%${filtros.descricao}%`);
+  }
+
+  if (filtros.categoria) {
+    where.push('categoria = ?');
+    params.push(filtros.categoria);
+  }
+
+  const whereClause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
+  return { whereClause, params };
+}
+
+// Função auxiliar para buscar ou criar carteira por tipo
+export async function buscarOuCriarCarteiraPorTipoD1(
+  db: D1Database,
+  telefone: string,
+  tipo: 'debito' | 'credito'
+): Promise<CarteiraRecord> {
+  const variacoes = telefoneVariacoes(telefone);
+  const preferida = variacoes[0];
+  
+  // Nomes padrão para carteiras
+  const nomeCarteira = tipo === 'credito' ? 'Cartão de Crédito' : 'Cartão de Débito';
+  
+  // Tenta buscar uma carteira existente com nome similar
+  for (const variacao of variacoes) {
+    const carteiras = await db
+      .prepare(`
+        SELECT * FROM carteiras 
+        WHERE telefone = ? AND ativo = 1 
+        AND (nome LIKE ? OR nome LIKE ?)
+        ORDER BY padrao DESC, criadoEm ASC
+        LIMIT 1
+      `)
+      .bind(
+        variacao,
+        `%${tipo}%`,
+        `%${tipo === 'credito' ? 'Crédito' : 'Débito'}%`
+      )
+      .all<CarteiraRecord>();
+    
+    if (carteiras.results && carteiras.results.length > 0) {
+      console.log(`✅ D1: Carteira encontrada para ${tipo}:`, carteiras.results[0].nome);
+      return carteiras.results[0];
+    }
+  }
+  
+  // Se não encontrou, busca qualquer carteira ativa do usuário
+  for (const variacao of variacoes) {
+    const carteira = await db
+      .prepare('SELECT * FROM carteiras WHERE telefone = ? AND ativo = 1 ORDER BY padrao DESC, criadoEm ASC LIMIT 1')
+      .bind(variacao)
+      .first<CarteiraRecord>();
+    
+    if (carteira) {
+      console.log(`✅ D1: Usando carteira existente:`, carteira.nome);
+      return carteira;
+    }
+  }
+  
+  // Se não encontrou nenhuma, cria uma nova
+  console.log(`📦 D1: Criando nova carteira ${tipo} para ${preferida}`);
+  const carteiraId = await criarCarteiraD1(db, telefone, {
+    nome: nomeCarteira,
+    descricao: `Carteira ${tipo === 'credito' ? 'de crédito' : 'de débito'}`,
+    padrao: false
+  });
+  
+  const novaCarteira = await buscarCarteiraPorIdD1(db, carteiraId, telefone);
+  if (!novaCarteira) {
+    throw new Error('Erro ao criar carteira');
+  }
+  
+  return novaCarteira;
+}
+
+export async function salvarTransacao(
+  db: D1Database,
+  transacao: Omit<TransacaoRecord, 'id'>
+): Promise<number> {
+  const agora = new Date();
+  const dataHora = transacao.dataHora || agora.toISOString();
+  const data = transacao.data || dataHora.slice(0, 10);
+  
+  const telefoneNormalizado = normalizarTelefone(transacao.telefone);
+  console.log('💾 D1: Salvando transação com telefone normalizado:', telefoneNormalizado);
+
+  // Importa validações
+  const { validarTransacaoCompletaD1 } = await import('./validacoesFinanceiras');
+
+  // Busca ou cria carteira se não foi fornecida (precisa para validação)
+  let carteiraId = transacao.carteiraId;
+  if (!carteiraId) {
+    const tipoCarteira = (transacao.metodo || 'debito') as 'debito' | 'credito';
+    try {
+      const carteira = await buscarOuCriarCarteiraPorTipoD1(db, telefoneNormalizado, tipoCarteira);
+      carteiraId = carteira.id || null;
+      console.log(`📦 D1: Carteira associada: ${carteira.nome} (ID: ${carteiraId})`);
+    } catch (error: any) {
+      console.error('⚠️ D1: Erro ao buscar/criar carteira, salvando sem carteiraId:', error.message);
+      carteiraId = null;
+    }
+  }
+
+  // Valida todas as regras financeiras ANTES de salvar
+  const validacao = await validarTransacaoCompletaD1(db as any, {
+    valor: transacao.valor,
+    tipo: (transacao.tipo || 'saida') as 'entrada' | 'saida',
+    metodo: (transacao.metodo || 'debito') as 'credito' | 'debito',
+    descricao: transacao.descricao,
+    data: data,
+    carteiraId: carteiraId,
+    telefone: telefoneNormalizado,
+    permitirDataFutura: false, // Transações normais não podem ter data futura
+  });
+
+  if (!validacao.valido) {
+    throw new Error(validacao.erro || 'Validação falhou');
+  }
+
+  const result = await db
+    .prepare(
+      `INSERT INTO transacoes 
+        (telefone, descricao, valor, categoria, tipo, metodo, dataHora, data, mensagemOriginal, carteiraId) 
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      telefoneNormalizado,
+      transacao.descricao,
+      transacao.valor,
+      transacao.categoria || 'outros',
+      transacao.tipo || 'saida',
+      transacao.metodo || 'debito',
+      dataHora,
+      data,
+      transacao.mensagemOriginal ?? null,
+      carteiraId
+    )
+    .run();
+
+  const id = Number(result.meta.last_row_id);
+  console.log('✅ D1: Transação salva com ID:', id, 'telefone:', telefoneNormalizado, 'carteiraId:', carteiraId);
+  return id;
+}
+
+export async function buscarTransacoes(
+  db: D1Database,
+  filtros: {
+    telefone?: string;
+    dataInicio?: string;
+    dataFim?: string;
+    valorMin?: number;
+    valorMax?: number;
+    descricao?: string;
+    categoria?: string;
+    limit?: number;
+    offset?: number;
+  }
+): Promise<TransacoesResultado> {
+  // Log para debug
+  if (filtros.telefone) {
+    const variacoes = telefoneVariacoes(filtros.telefone);
+    console.log('🔍 Buscando transações com variações:', variacoes);
+  }
+  
+  const { whereClause, params } = montarWhere(filtros);
+  const limit = filtros.limit && filtros.limit > 0 ? Math.min(filtros.limit, 100) : 20;
+  const offset = filtros.offset && filtros.offset > 0 ? filtros.offset : 0;
+
+  // Ajusta a cláusula WHERE para usar o alias 't.' da tabela transacoes
+  const whereClauseComAlias = whereClause
+    .replace(/\btelefone\s*=/g, 't.telefone =')
+    .replace(/date\(data\)/g, 'date(t.data)')
+    .replace(/\bvalor\s*>=/g, 't.valor >=')
+    .replace(/\bvalor\s*<=/g, 't.valor <=')
+    .replace(/\bdescricao\s+LIKE/g, 't.descricao LIKE')
+    .replace(/\bcategoria\s*=/g, 't.categoria =');
+
+  console.log('🔍 Executando COUNT com WHERE:', whereClauseComAlias);
+  console.log('🔍 Parâmetros do COUNT:', params);
+  
+  const totalRow = await db
+    .prepare(`SELECT COUNT(*) as total FROM transacoes t ${whereClauseComAlias}`)
+    .bind(...params)
+    .first<{ total: number }>();
+  
+  console.log('🔍 Resultado do COUNT:', totalRow?.total ?? 0);
+
+  console.log('🔍 Executando SELECT com WHERE:', whereClauseComAlias);
+  console.log('🔍 Parâmetros do SELECT:', [...params, limit, offset]);
+  
+  // Query com LEFT JOIN para incluir dados da carteira
+  const rows = await db
+    .prepare(
+      `SELECT 
+        t.id, 
+        t.telefone, 
+        t.descricao, 
+        t.valor, 
+        t.categoria, 
+        t.tipo, 
+        t.metodo, 
+        t.dataHora, 
+        t.data, 
+        t.mensagemOriginal,
+        t.carteiraId,
+        c.id as carteira_id,
+        c.nome as carteira_nome
+       FROM transacoes t
+       LEFT JOIN carteiras c ON t.carteiraId = c.id AND c.ativo = 1
+       ${whereClauseComAlias}
+       ORDER BY t.id DESC, datetime(t.dataHora) DESC 
+       LIMIT ? OFFSET ?`
+    )
+    .bind(...params, limit, offset)
+    .all<any>();
+  
+  console.log('🔍 Resultado do SELECT:', {
+    quantidade: rows.results?.length ?? 0,
+    telefonesEncontrados: rows.results?.map((t: any) => t.telefone).slice(0, 5) ?? []
+  });
+
+  // Processa transações e atualiza as que não têm carteiraId (em background)
+  const transacoesSemCarteira = (rows.results || []).filter((t: any) => !t.carteiraId && !t.carteira_id);
+  if (transacoesSemCarteira.length > 0) {
+    console.log(`🔄 D1: ${transacoesSemCarteira.length} transações sem carteira detectadas. Associando carteiras...`);
+    // Atualiza em background para não bloquear a resposta
+    (async () => {
+      for (const t of transacoesSemCarteira.slice(0, 10)) { // Limita a 10 por vez
+        try {
+          const tipoCarteira = (t.metodo || 'debito') as 'debito' | 'credito';
+          const carteira = await buscarOuCriarCarteiraPorTipoD1(db, t.telefone, tipoCarteira);
+          await db
+            .prepare('UPDATE transacoes SET carteiraId = ? WHERE id = ?')
+            .bind(carteira.id, t.id)
+            .run();
+          console.log(`✅ D1: Transação ${t.id} associada à carteira ${carteira.nome}`);
+        } catch (error: any) {
+          console.error(`❌ D1: Erro ao associar carteira para transação ${t.id}:`, error.message);
+        }
+      }
+    })();
+  }
+
+  return {
+    total: totalRow?.total ?? 0,
+    transacoes: (rows.results || []).map((t: any) => {
+      // Se não tem carteira no JOIN mas tem carteiraId, busca a carteira
+      let carteiraData = t.carteira_id ? {
+        id: t.carteira_id,
+        nome: t.carteira_nome,
+        tipo: t.metodo === 'credito' ? 'credito' : 'debito',
+      } : null;
+      
+      // Se tem carteiraId mas não tem dados da carteira, tenta buscar (em background)
+      if (t.carteiraId && !carteiraData) {
+        (async () => {
+          try {
+            const carteira = await buscarCarteiraPorIdD1(db, t.carteiraId, t.telefone);
+            if (carteira) {
+              console.log(`✅ D1: Carteira ${carteira.id} encontrada para transação ${t.id}`);
+            }
+          } catch (error) {
+            // Ignora erros em background
+          }
+        })();
+      }
+      
+      return {
+        id: t.id,
+        telefone: t.telefone,
+        descricao: t.descricao,
+        valor: t.valor,
+        categoria: t.categoria,
+        tipo: t.tipo === 'entrada' ? 'entrada' : 'saida',
+        metodo: t.metodo === 'credito' ? 'credito' : 'debito',
+        dataHora: t.dataHora ?? new Date().toISOString(),
+        data: t.data ?? (t.dataHora ? t.dataHora.slice(0, 10) : new Date().toISOString().slice(0, 10)),
+        mensagemOriginal: t.mensagemOriginal ?? null,
+        carteiraId: t.carteiraId ?? null,
+        carteira: carteiraData,
+      };
+    }),
+  };
+}
+
+export async function calcularEstatisticas(
+  db: D1Database,
+  filtros: {
+    telefone?: string;
+    dataInicio?: string;
+    dataFim?: string;
+    valorMin?: number;
+    valorMax?: number;
+    descricao?: string;
+    categoria?: string;
+  } = {}
+): Promise<Estatisticas> {
+  const { whereClause, params } = montarWhere(filtros);
+
+  const statsRow = await db
+    .prepare(
+      `SELECT
+        COUNT(*) as totalTransacoes,
+        SUM(CASE WHEN tipo = 'entrada' THEN valor ELSE 0 END) as totalEntradas,
+        SUM(CASE WHEN tipo = 'saida' THEN valor ELSE 0 END) as totalSaidas,
+        AVG(valor) as mediaGasto,
+        MAX(valor) as maiorGasto,
+        MIN(valor) as menorGasto
+      FROM transacoes
+      ${whereClause}`
+    )
+    .bind(...params)
+    .first<{
+      totalTransacoes: number;
+      totalEntradas: number;
+      totalSaidas: number;
+      mediaGasto: number;
+      maiorGasto: number;
+      menorGasto: number;
+    }>();
+
+  // Gasto hoje e no mês corrente
+  const hojeIso = new Date().toISOString().slice(0, 10);
+  const inicioMes = new Date();
+  inicioMes.setDate(1);
+  const mesIso = inicioMes.toISOString().slice(0, 10);
+
+  const gastoHojeRow = await db
+    .prepare(
+      `SELECT 
+        SUM(CASE WHEN tipo = 'saida' THEN valor ELSE 0 END) as gastoHoje
+      FROM transacoes
+      ${whereClause ? `${whereClause} AND` : 'WHERE'} date(data) = date(?)`
+    )
+    .bind(...params, hojeIso)
+    .first<{ gastoHoje: number }>();
+
+  const gastoMesRow = await db
+    .prepare(
+      `SELECT 
+        SUM(CASE WHEN tipo = 'saida' THEN valor ELSE 0 END) as gastoMes
+      FROM transacoes
+      ${whereClause ? `${whereClause} AND` : 'WHERE'} date(data) >= date(?)`
+    )
+    .bind(...params, mesIso)
+    .first<{ gastoMes: number }>();
+
+  const totalEntradas = statsRow?.totalEntradas || 0;
+  const totalSaidas = statsRow?.totalSaidas || 0;
+
+  return {
+    totalEntradas,
+    totalSaidas,
+    saldo: totalEntradas - totalSaidas,
+    totalTransacoes: statsRow?.totalTransacoes || 0,
+    mediaGasto: statsRow?.mediaGasto || 0,
+    maiorGasto: statsRow?.maiorGasto || 0,
+    menorGasto: statsRow?.menorGasto || 0,
+    gastoHoje: gastoHojeRow?.gastoHoje || 0,
+    gastoMes: gastoMesRow?.gastoMes || 0,
+  };
+}
+
+export async function gastosPorDia(
+  db: D1Database,
+  telefone?: string,
+  dias: number = 30
+): Promise<Array<{ data: string; entradas: number; saidas: number; saldo: number }>> {
+  const filtros: any = {};
+  if (telefone) filtros.telefone = telefone;
+
+  const { whereClause, params } = montarWhere(filtros);
+
+  const rows = await db
+    .prepare(
+      `SELECT 
+        data,
+        SUM(CASE WHEN tipo = 'entrada' THEN valor ELSE 0 END) as entradas,
+        SUM(CASE WHEN tipo = 'saida' THEN valor ELSE 0 END) as saidas
+      FROM transacoes
+      ${whereClause}
+      GROUP BY data
+      ORDER BY date(data) DESC
+      LIMIT ?`
+    )
+    .bind(...params, dias)
+    .all<{ data: string; entradas: number; saidas: number }>();
+
+  return (rows.results || []).map((row: any) => ({
+    data: row.data,
+    entradas: row.entradas || 0,
+    saidas: row.saidas || 0,
+    saldo: (row.entradas || 0) - (row.saidas || 0),
+  }));
+}
+
+export async function listarTelefones(
+  db: D1Database
+): Promise<Array<{ telefone: string; total: number; totalGasto: number }>> {
+  const rows = await db
+    .prepare(
+      `SELECT telefone, COUNT(*) as total,
+        SUM(CASE WHEN tipo = 'saida' THEN valor ELSE 0 END) as totalGasto
+       FROM transacoes
+       GROUP BY telefone
+       ORDER BY total DESC
+       LIMIT 100`
+    )
+    .all<{ telefone: string; total: number; totalGasto: number }>();
+
+  return rows.results || [];
+}
+
+export async function resumoPorTelefone(
+  db: D1Database,
+  telefone: string
+): Promise<{
+  telefone: string;
+  totalEntradas: number;
+  totalSaidas: number;
+  saldo: number;
+  totalTransacoes: number;
+}> {
+  const stats = await calcularEstatisticas(db, { telefone });
+  return {
+    telefone: normalizarTelefone(telefone),
+    totalEntradas: stats.totalEntradas,
+    totalSaidas: stats.totalSaidas,
+    saldo: stats.saldo,
+    totalTransacoes: stats.totalTransacoes,
+  };
+}
+
+export async function registrarNumero(db: D1Database, telefone: string): Promise<void> {
+  const variacoes = telefoneVariacoes(telefone);
+  const preferida = variacoes[0];
+  await db
+    .prepare(
+      `INSERT INTO numeros_registrados (telefone, primeiraMensagemEnviada, totalMensagensEnviadas)
+       VALUES (?, CURRENT_TIMESTAMP, 1)
+       ON CONFLICT(telefone) DO UPDATE SET 
+         ultimaMensagemEnviada = CURRENT_TIMESTAMP,
+         totalMensagensEnviadas = COALESCE(totalMensagensEnviadas, 0) + 1`
+    )
+    .bind(preferida)
+    .run();
+}
+
+export async function atualizarTransacao(
+  db: D1Database,
+  id: number,
+  transacao: Partial<Omit<TransacaoRecord, 'id' | 'telefone'>>
+): Promise<boolean> {
+  const campos: string[] = [];
+  const valores: any[] = [];
+  
+  if (transacao.descricao !== undefined) {
+    campos.push('descricao = ?');
+    valores.push(transacao.descricao.trim());
+  }
+  
+  if (transacao.valor !== undefined) {
+    campos.push('valor = ?');
+    valores.push(transacao.valor);
+  }
+  
+  if (transacao.categoria !== undefined) {
+    campos.push('categoria = ?');
+    valores.push(transacao.categoria);
+  }
+  
+  if (transacao.tipo !== undefined) {
+    campos.push('tipo = ?');
+    valores.push(transacao.tipo);
+  }
+  
+  if (transacao.metodo !== undefined) {
+    campos.push('metodo = ?');
+    valores.push(transacao.metodo);
+  }
+  
+  if (transacao.dataHora !== undefined) {
+    campos.push('dataHora = ?');
+    valores.push(transacao.dataHora);
+  }
+  
+  if (transacao.data !== undefined) {
+    campos.push('data = ?');
+    valores.push(transacao.data);
+  }
+  
+  if (transacao.carteiraId !== undefined) {
+    campos.push('carteiraId = ?');
+    valores.push(transacao.carteiraId);
+  }
+  
+  if (campos.length === 0) {
+    return false; // Nenhum campo para atualizar
+  }
+  
+  valores.push(id);
+  const query = `UPDATE transacoes SET ${campos.join(', ')} WHERE id = ?`;
+  
+  const result = await db.prepare(query).bind(...valores).run();
+  return (result.meta.changes || 0) > 0;
+}
+
+export async function removerTransacao(db: D1Database, id: number): Promise<boolean> {
+  const result = await db.prepare('DELETE FROM transacoes WHERE id = ?').bind(id).run();
+  return (result.meta.changes || 0) > 0;
+}
+
+// Funções de gerenciamento de usuários
+export async function buscarUsuarioPorTelefone(
+  db: D1Database,
+  telefone: string
+): Promise<{
+  id: number;
+  telefone: string;
+  nome: string;
+  email: string | null;
+  dataCadastro: string;
+  trialExpiraEm: string;
+  status: string;
+  plano: string | null;
+  assinaturaEm: string | null;
+  criadoEm: string;
+  atualizadoEm: string;
+} | null> {
+  const telefoneNormalizado = normalizarTelefone(telefone);
+  const variacoes = telefoneVariacoes(telefone);
+  
+  for (const variacao of variacoes) {
+    const result = await db
+      .prepare('SELECT * FROM usuarios WHERE telefone = ?')
+      .bind(variacao)
+      .first<{
+        id: number;
+        telefone: string;
+        nome: string;
+        email: string | null;
+        dataCadastro: string;
+        trialExpiraEm: string;
+        status: string;
+        plano: string | null;
+        assinaturaEm: string | null;
+        criadoEm: string;
+        atualizadoEm: string;
+      }>();
+    
+    if (result) return result;
+  }
+  
+  return null;
+}
+
+export async function criarUsuario(
+  db: D1Database,
+  dados: {
+    telefone: string;
+    nome: string;
+    email?: string | null;
+    trialExpiraEm: Date;
+  }
+): Promise<number> {
+  const telefoneNormalizado = normalizarTelefone(dados.telefone);
+  const variacoes = telefoneVariacoes(dados.telefone);
+  const preferida = variacoes[0];
+  
+  const result = await db
+    .prepare(
+      `INSERT INTO usuarios (telefone, nome, email, dataCadastro, trialExpiraEm, status, criadoEm, atualizadoEm)
+       VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, 'trial', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+    )
+    .bind(
+      preferida,
+      dados.nome.trim(),
+      dados.email?.trim() || null,
+      dados.trialExpiraEm.toISOString()
+    )
+    .run();
+  
+  return Number(result.meta.last_row_id);
+}
+
+export async function atualizarUsuarioStatus(
+  db: D1Database,
+  telefone: string,
+  status: string
+): Promise<boolean> {
+  const telefoneNormalizado = normalizarTelefone(telefone);
+  const variacoes = telefoneVariacoes(telefone);
+  
+  for (const variacao of variacoes) {
+    const result = await db
+      .prepare('UPDATE usuarios SET status = ?, atualizadoEm = CURRENT_TIMESTAMP WHERE telefone = ?')
+      .bind(status, variacao)
+      .run();
+    
+    if ((result.meta.changes || 0) > 0) return true;
+  }
+  
+  return false;
+}
+
+export async function atualizarUsuarioPerfil(
+  db: D1Database,
+  telefone: string,
+  dados: { nome?: string; email?: string | null }
+): Promise<boolean> {
+  const telefoneNormalizado = normalizarTelefone(telefone);
+  const variacoes = telefoneVariacoes(telefone);
+  
+  const updates: string[] = [];
+  const params: Array<string | null> = [];
+  
+  if (dados.nome !== undefined) {
+    updates.push('nome = ?');
+    params.push(dados.nome.trim());
+  }
+  
+  if (dados.email !== undefined) {
+    updates.push('email = ?');
+    params.push(dados.email?.trim() || null);
+  }
+  
+  if (updates.length === 0) return false;
+  
+  updates.push('atualizadoEm = CURRENT_TIMESTAMP');
+  
+  for (const variacao of variacoes) {
+    const result = await db
+      .prepare(`UPDATE usuarios SET ${updates.join(', ')} WHERE telefone = ?`)
+      .bind(...params, variacao)
+      .run();
+    
+    if ((result.meta.changes || 0) > 0) return true;
+  }
+  
+  return false;
+}
+
+export async function excluirTodosDadosUsuario(
+  db: D1Database,
+  telefone: string
+): Promise<{ sucesso: boolean; dadosRemovidos?: { transacoes: number; agendamentos: number; categorias: number; usuarios: number; numerosRegistrados: number } }> {
+  const telefoneNormalizado = normalizarTelefone(telefone);
+  const variacoes = telefoneVariacoes(telefone);
+  
+  let totalTransacoes = 0;
+  let totalAgendamentos = 0;
+  let totalCategorias = 0;
+  let totalUsuarios = 0;
+  let totalNumerosRegistrados = 0;
+  
+  try {
+    for (const variacao of variacoes) {
+      // Remove transações e conta quantas foram removidas
+      const resultTransacoes = await db.prepare('DELETE FROM transacoes WHERE telefone = ?').bind(variacao).run();
+      totalTransacoes += resultTransacoes.meta.changes || 0;
+      
+      // Remove agendamentos e conta quantos foram removidos
+      const resultAgendamentos = await db.prepare('DELETE FROM agendamentos WHERE telefone = ?').bind(variacao).run();
+      totalAgendamentos += resultAgendamentos.meta.changes || 0;
+      
+      // Remove categorias personalizadas e conta quantas foram removidas
+      const resultCategorias = await db.prepare('DELETE FROM categorias WHERE telefone = ? AND padrao = 0').bind(variacao).run();
+      totalCategorias += resultCategorias.meta.changes || 0;
+      
+      // Remove número registrado e conta quantos foram removidos
+      const resultNumeros = await db.prepare('DELETE FROM numeros_registrados WHERE telefone = ?').bind(variacao).run();
+      totalNumerosRegistrados += resultNumeros.meta.changes || 0;
+      
+      // Remove usuário e conta quantos foram removidos
+      const resultUsuarios = await db.prepare('DELETE FROM usuarios WHERE telefone = ?').bind(variacao).run();
+      totalUsuarios += resultUsuarios.meta.changes || 0;
+    }
+    
+    return {
+      sucesso: true,
+      dadosRemovidos: {
+        transacoes: totalTransacoes,
+        agendamentos: totalAgendamentos,
+        categorias: totalCategorias,
+        usuarios: totalUsuarios,
+        numerosRegistrados: totalNumerosRegistrados
+      }
+    };
+  } catch (error) {
+    console.error('Erro ao excluir dados do usuário:', error);
+    return { sucesso: false };
+  }
+}
+
+// ========== FUNÇÕES DE CATEGORIAS ==========
+
+export interface CategoriaRecord {
+  id: number;
+  telefone: string | null;
+  nome: string;
+  descricao: string | null;
+  cor: string | null;
+  padrao: number; // 0 ou 1 (SQLite não tem boolean)
+  tipo: string;
+  criadoEm: string;
+  atualizadoEm: string;
+}
+
+// Categorias padrão do sistema
+const CATEGORIAS_PADRAO_D1 = [
+  // Saídas
+  { nome: 'Alimentação', descricao: 'Gastos com comida e restaurantes', tipo: 'saida', cor: '#FF6B6B' },
+  { nome: 'Transporte', descricao: 'Combustível, passagens, táxi', tipo: 'saida', cor: '#4ECDC4' },
+  { nome: 'Moradia', descricao: 'Aluguel, condomínio, água, luz', tipo: 'saida', cor: '#45B7D1' },
+  { nome: 'Saúde', descricao: 'Médicos, remédios, plano de saúde', tipo: 'saida', cor: '#FFA07A' },
+  { nome: 'Educação', descricao: 'Cursos, livros, mensalidades', tipo: 'saida', cor: '#98D8C8' },
+  { nome: 'Lazer', descricao: 'Cinema, viagens, entretenimento', tipo: 'saida', cor: '#F7DC6F' },
+  { nome: 'Compras', descricao: 'Roupas, eletrônicos, supermercado', tipo: 'saida', cor: '#BB8FCE' },
+  { nome: 'Outros', descricao: 'Outras despesas', tipo: 'saida', cor: '#95A5A6' },
+  
+  // Entradas
+  { nome: 'Salário', descricao: 'Rendimento do trabalho', tipo: 'entrada', cor: '#52BE80' },
+  { nome: 'Freelance', descricao: 'Trabalhos autônomos', tipo: 'entrada', cor: '#5DADE2' },
+  { nome: 'Investimentos', descricao: 'Dividendos, juros', tipo: 'entrada', cor: '#F4D03F' },
+  { nome: 'Vendas', descricao: 'Venda de produtos ou serviços', tipo: 'entrada', cor: '#85C1E2' },
+  { nome: 'Outros', descricao: 'Outras receitas', tipo: 'entrada', cor: '#A9DFBF' },
+];
+
+// Inicializar categorias padrão no D1
+async function inicializarCategoriasPadraoD1(db: D1Database): Promise<void> {
+  try {
+    // Verifica se já existem categorias padrão
+    const categoriasExistentes = await db
+      .prepare('SELECT COUNT(*) as count FROM categorias WHERE padrao = 1')
+      .first<{ count: number }>();
+    
+    const count = categoriasExistentes?.count || 0;
+    
+    if (count === 0) {
+      console.log('📋 Criando categorias padrão no D1...');
+      
+      for (const cat of CATEGORIAS_PADRAO_D1) {
+        // Verifica se já existe antes de criar
+        const existente = await db
+          .prepare('SELECT id FROM categorias WHERE padrao = 1 AND nome = ?')
+          .bind(cat.nome)
+          .first();
+        
+        if (!existente) {
+          await db
+            .prepare(`
+              INSERT INTO categorias (telefone, nome, descricao, cor, padrao, tipo, criadoEm, atualizadoEm)
+              VALUES (?, ?, ?, ?, 1, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            `)
+            .bind(null, cat.nome, cat.descricao, cat.cor, cat.tipo)
+            .run();
+        }
+      }
+      
+      console.log(`✅ ${CATEGORIAS_PADRAO_D1.length} categorias padrão criadas no D1!`);
+    }
+  } catch (error: any) {
+    console.error('❌ Erro ao inicializar categorias padrão no D1:', error);
+    // Não lança erro para não quebrar a busca
+  }
+}
+
+export async function buscarCategoriasD1(
+  db: D1Database,
+  telefone: string
+): Promise<CategoriaRecord[]> {
+  // Garante que as categorias padrão existem
+  await inicializarCategoriasPadraoD1(db);
+  
+  const variacoes = telefoneVariacoes(telefone);
+  
+  // Busca categorias do usuário e categorias padrão (padrao = 1)
+  const categorias = await db
+    .prepare(`
+      SELECT * FROM categorias 
+      WHERE telefone IN (${variacoes.map(() => '?').join(',')}) OR padrao = 1
+      ORDER BY padrao DESC, nome ASC
+    `)
+    .bind(...variacoes)
+    .all<CategoriaRecord>();
+  
+  return categorias.results || [];
+}
+
+export async function criarCategoriaD1(
+  db: D1Database,
+  telefone: string,
+  dados: { nome: string; descricao?: string; cor?: string; tipo?: string }
+): Promise<number> {
+  const variacoes = telefoneVariacoes(telefone);
+  const preferida = variacoes[0];
+  
+  // Verifica se já existe
+  const existente = await db
+    .prepare('SELECT id FROM categorias WHERE telefone = ? AND nome = ?')
+    .bind(preferida, dados.nome.trim())
+    .first();
+  
+  if (existente) {
+    throw new Error('Já existe uma categoria com este nome');
+  }
+  
+  const result = await db
+    .prepare(`
+      INSERT INTO categorias (telefone, nome, descricao, cor, padrao, tipo, criadoEm, atualizadoEm)
+      VALUES (?, ?, ?, ?, 0, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    `)
+    .bind(
+      preferida,
+      dados.nome.trim(),
+      dados.descricao?.trim() || null,
+      dados.cor?.trim() || null,
+      dados.tipo || 'saida'
+    )
+    .run();
+  
+  return Number(result.meta.last_row_id);
+}
+
+export async function atualizarCategoriaD1(
+  db: D1Database,
+  id: number,
+  telefone: string,
+  dados: { nome?: string; descricao?: string; cor?: string; tipo?: string }
+): Promise<boolean> {
+  const categoria = await db
+    .prepare('SELECT * FROM categorias WHERE id = ?')
+    .bind(id)
+    .first<CategoriaRecord>();
+  
+  if (!categoria) {
+    throw new Error('Categoria não encontrada');
+  }
+  
+  // PROTEÇÃO CRÍTICA: Nunca permite atualizar categorias padrão, mesmo que alguém tente burlar
+  if (categoria.padrao === 1) {
+    console.warn(`🚫 Tentativa de atualizar categoria padrão bloqueada! ID: ${id}, Nome: ${categoria.nome}`);
+    throw new Error('Não é possível atualizar categorias padrão do sistema');
+  }
+  
+  // Verifica se a categoria pertence ao usuário
+  const variacoes = telefoneVariacoes(telefone);
+  const telefoneCorresponde = variacoes.includes(categoria.telefone || '');
+  
+  if (!telefoneCorresponde) {
+    throw new Error('Você não tem permissão para atualizar esta categoria');
+  }
+  
+  const updates: string[] = [];
+  const params: Array<string | null> = [];
+  
+  if (dados.nome !== undefined) {
+    updates.push('nome = ?');
+    params.push(dados.nome.trim());
+  }
+  if (dados.descricao !== undefined) {
+    updates.push('descricao = ?');
+    params.push(dados.descricao?.trim() || null);
+  }
+  if (dados.cor !== undefined) {
+    updates.push('cor = ?');
+    params.push(dados.cor?.trim() || null);
+  }
+  if (dados.tipo !== undefined) {
+    updates.push('tipo = ?');
+    params.push(dados.tipo);
+  }
+  
+  if (updates.length === 0) return false;
+  
+  updates.push('atualizadoEm = CURRENT_TIMESTAMP');
+  
+  await db
+    .prepare(`UPDATE categorias SET ${updates.join(', ')} WHERE id = ?`)
+    .bind(...params, id)
+    .run();
+  
+  return true;
+}
+
+export async function removerCategoriaD1(
+  db: D1Database,
+  id: number,
+  telefone: string
+): Promise<boolean> {
+  const categoria = await db
+    .prepare('SELECT * FROM categorias WHERE id = ?')
+    .bind(id)
+    .first<CategoriaRecord>();
+  
+  if (!categoria) {
+    throw new Error('Categoria não encontrada');
+  }
+  
+  // PROTEÇÃO CRÍTICA: Nunca permite remover categorias padrão, mesmo que alguém tente burlar
+  if (categoria.padrao === 1) {
+    console.warn(`🚫 Tentativa de remover categoria padrão bloqueada! ID: ${id}, Nome: ${categoria.nome}`);
+    throw new Error('Não é possível remover categorias padrão do sistema');
+  }
+  
+  // Verifica se a categoria pertence ao usuário
+  const variacoes = telefoneVariacoes(telefone);
+  const telefoneCorresponde = variacoes.includes(categoria.telefone || '');
+  
+  if (!telefoneCorresponde) {
+    throw new Error('Você não tem permissão para remover esta categoria');
+  }
+  
+  // PROTEÇÃO EXTRA: SQL também bloqueia categorias padrão (proteção em múltiplas camadas)
+  const result = await db
+    .prepare('DELETE FROM categorias WHERE id = ? AND padrao = 0')
+    .bind(id)
+    .run();
+  
+  // Verifica se realmente deletou (proteção extra)
+  if ((result.meta.changes || 0) === 0) {
+    // Se não deletou, verifica novamente se é padrão (proteção contra race condition)
+    const categoriaVerificada = await db
+      .prepare('SELECT padrao FROM categorias WHERE id = ?')
+      .bind(id)
+      .first<{ padrao: number }>();
+    
+    if (categoriaVerificada && categoriaVerificada.padrao === 1) {
+      throw new Error('Não é possível remover categorias padrão do sistema');
+    }
+    
+    throw new Error('Erro ao remover categoria');
+  }
+  
+  return true;
+}
+
+// ========== FUNÇÕES DE AGENDAMENTOS ==========
+
+export interface AgendamentoRecord {
+  id: number;
+  telefone: string;
+  descricao: string;
+  valor: number;
+  dataAgendamento: string;
+  tipo: string;
+  status: string;
+  categoria: string | null;
+  notificado: number; // 0 ou 1
+  // Campos para agendamentos recorrentes
+  recorrente: number; // 0 ou 1
+  totalParcelas: number | null;
+  parcelaAtual: number | null;
+  agendamentoPaiId: number | null;
+  criadoEm: string;
+  atualizadoEm: string;
+}
+
+export async function buscarAgendamentosD1(
+  db: D1Database,
+  telefone: string,
+  filtros?: { status?: string; dataInicio?: string; dataFim?: string }
+): Promise<AgendamentoRecord[]> {
+  const variacoes = telefoneVariacoes(telefone);
+  
+  if (variacoes.length === 0) {
+    return [];
+  }
+  
+  let query = `SELECT * FROM agendamentos WHERE telefone IN (${variacoes.map(() => '?').join(',')})`;
+  const params: Array<string> = [...variacoes];
+  
+  if (filtros?.status) {
+    query += ' AND status = ?';
+    params.push(filtros.status);
+  }
+  if (filtros?.dataInicio) {
+    query += ' AND date(dataAgendamento) >= date(?)';
+    params.push(filtros.dataInicio);
+  }
+  if (filtros?.dataFim) {
+    query += ' AND date(dataAgendamento) <= date(?)';
+    params.push(filtros.dataFim);
+  }
+  
+  query += ' ORDER BY date(dataAgendamento) ASC';
+  
+  try {
+    const result = await db.prepare(query).bind(...params).all<AgendamentoRecord>();
+    return result.results || [];
+  } catch (error: any) {
+    console.error('Erro ao buscar agendamentos:', error);
+    console.error('Query:', query);
+    console.error('Params:', params);
+    throw error;
+  }
+}
+
+export async function buscarAgendamentoPorIdD1(
+  db: D1Database,
+  id: number
+): Promise<AgendamentoRecord | null> {
+  const result = await db
+    .prepare('SELECT * FROM agendamentos WHERE id = ?')
+    .bind(id)
+    .first<AgendamentoRecord>();
+  
+  return result || null;
+}
+
+export async function criarAgendamentoD1(
+  db: D1Database,
+  dados: {
+    telefone: string;
+    descricao: string;
+    valor: number;
+    dataAgendamento: string;
+    tipo: string;
+    categoria?: string;
+    recorrente?: boolean;
+    totalParcelas?: number;
+    parcelaAtual?: number;
+    agendamentoPaiId?: number;
+  }
+): Promise<number> {
+  const variacoes = telefoneVariacoes(dados.telefone);
+  const preferida = variacoes[0];
+  
+  const result = await db
+    .prepare(`
+      INSERT INTO agendamentos 
+      (telefone, descricao, valor, dataAgendamento, tipo, status, categoria, notificado, recorrente, totalParcelas, parcelaAtual, agendamentoPaiId, criadoEm, atualizadoEm)
+      VALUES (?, ?, ?, ?, ?, 'pendente', ?, 0, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    `)
+    .bind(
+      preferida,
+      dados.descricao,
+      dados.valor,
+      dados.dataAgendamento,
+      dados.tipo,
+      dados.categoria || 'outros',
+      dados.recorrente ? 1 : 0,
+      dados.totalParcelas || null,
+      dados.parcelaAtual || null,
+      dados.agendamentoPaiId || null
+    )
+    .run();
+  
+  return Number(result.meta.last_row_id);
+}
+
+// Criar agendamentos recorrentes (cria todos de uma vez)
+export async function criarAgendamentosRecorrentesD1(
+  db: D1Database,
+  dados: {
+    telefone: string;
+    descricao: string;
+    valor: number;
+    dataAgendamento: string;
+    tipo: string;
+    categoria?: string;
+    totalParcelas: number;
+  }
+): Promise<number[]> {
+  const ids: number[] = [];
+  const dataInicial = new Date(dados.dataAgendamento);
+  
+  // Cria o primeiro agendamento (pai)
+  const primeiroId = await criarAgendamentoD1(db, {
+    ...dados,
+    parcelaAtual: 1,
+    agendamentoPaiId: undefined,
+    recorrente: true,
+  });
+  ids.push(primeiroId);
+  
+  // Cria os demais agendamentos (filhos)
+  for (let i = 2; i <= dados.totalParcelas; i++) {
+    const dataParcela = new Date(dataInicial);
+    dataParcela.setMonth(dataParcela.getMonth() + (i - 1));
+    
+    const id = await criarAgendamentoD1(db, {
+      ...dados,
+      dataAgendamento: dataParcela.toISOString().split('T')[0],
+      parcelaAtual: i,
+      agendamentoPaiId: primeiroId,
+      recorrente: true,
+    });
+    ids.push(id);
+  }
+  
+  return ids;
+}
+
+export async function atualizarStatusAgendamentoD1(
+  db: D1Database,
+  id: number,
+  status: string
+): Promise<boolean> {
+  const result = await db
+    .prepare('UPDATE agendamentos SET status = ?, atualizadoEm = CURRENT_TIMESTAMP WHERE id = ?')
+    .bind(status, id)
+    .run();
+  
+  return (result.meta.changes || 0) > 0;
+}
+
+export async function atualizarAgendamentoD1(
+  db: D1Database,
+  id: number,
+  dados: {
+    descricao?: string;
+    valor?: number;
+    dataAgendamento?: string;
+    tipo?: string;
+    categoria?: string;
+    status?: string;
+  }
+): Promise<boolean> {
+  const campos: string[] = [];
+  const valores: any[] = [];
+  
+  if (dados.descricao !== undefined) {
+    campos.push('descricao = ?');
+    valores.push(dados.descricao);
+  }
+  if (dados.valor !== undefined) {
+    campos.push('valor = ?');
+    valores.push(dados.valor);
+  }
+  if (dados.dataAgendamento !== undefined) {
+    campos.push('dataAgendamento = ?');
+    valores.push(dados.dataAgendamento);
+  }
+  if (dados.tipo !== undefined) {
+    campos.push('tipo = ?');
+    valores.push(dados.tipo);
+  }
+  if (dados.categoria !== undefined) {
+    campos.push('categoria = ?');
+    valores.push(dados.categoria);
+  }
+  if (dados.status !== undefined) {
+    campos.push('status = ?');
+    valores.push(dados.status);
+  }
+  
+  if (campos.length === 0) {
+    return false;
+  }
+  
+  campos.push('atualizadoEm = CURRENT_TIMESTAMP');
+  valores.push(id);
+  
+  const query = `UPDATE agendamentos SET ${campos.join(', ')} WHERE id = ?`;
+  const result = await db.prepare(query).bind(...valores).run();
+  
+  return (result.meta.changes || 0) > 0;
+}
+
+export async function removerAgendamentoD1(
+  db: D1Database,
+  id: number
+): Promise<boolean> {
+  const result = await db
+    .prepare('DELETE FROM agendamentos WHERE id = ?')
+    .bind(id)
+    .run();
+  
+  return (result.meta.changes || 0) > 0;
+}
+
+// ========== NOTIFICAÇÕES (para SSE fallback) ==========
+
+// Cria a tabela de notificações se não existir
+export async function criarTabelaNotificacoes(db: D1Database): Promise<void> {
+  try {
+    // Executa queries separadamente para evitar problemas com db.exec()
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS notificacoes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telefone TEXT NOT NULL,
+        tipo TEXT NOT NULL,
+        dados TEXT NOT NULL,
+        lida INTEGER NOT NULL DEFAULT 0,
+        criadoEm TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `).run();
+    
+    // Cria índices separadamente
+    try {
+      await db.prepare('CREATE INDEX IF NOT EXISTS idx_notificacoes_telefone ON notificacoes(telefone)').run();
+    } catch (e) {
+      // Índice pode já existir, ignora erro
+      console.log('   ℹ️  Índice idx_notificacoes_telefone já existe ou erro ao criar');
+    }
+    
+    try {
+      await db.prepare('CREATE INDEX IF NOT EXISTS idx_notificacoes_lida ON notificacoes(lida)').run();
+    } catch (e) {
+      // Índice pode já existir, ignora erro
+      console.log('   ℹ️  Índice idx_notificacoes_lida já existe ou erro ao criar');
+    }
+  } catch (error: any) {
+    // Se a tabela já existe, não é um erro crítico
+    if (error.message && error.message.includes('already exists')) {
+      console.log('   ℹ️  Tabela notificacoes já existe');
+      return;
+    }
+    console.error('❌ Erro ao criar tabela notificacoes:', error);
+    throw error;
+  }
+}
+
+// Salva uma notificação no D1
+export async function salvarNotificacaoD1(
+  db: D1Database,
+  telefone: string,
+  tipo: string,
+  dados: any
+): Promise<number> {
+  // Garante que a tabela existe
+  await criarTabelaNotificacoes(db);
+  
+  const dadosJson = JSON.stringify(dados);
+  const result = await db
+    .prepare('INSERT INTO notificacoes (telefone, tipo, dados, lida) VALUES (?, ?, ?, 0)')
+    .bind(telefone, tipo, dadosJson)
+    .run();
+  
+  return Number(result.meta.last_row_id);
+}
+
+// Busca notificações não lidas para um telefone
+export async function buscarNotificacoesNaoLidasD1(
+  db: D1Database,
+  telefone: string
+): Promise<NotificacaoRecord[]> {
+  try {
+    await criarTabelaNotificacoes(db);
+    
+    if (!db) {
+      console.error('❌ Database não disponível em buscarNotificacoesNaoLidasD1');
+      return [];
+    }
+    
+    const result = await db
+      .prepare('SELECT * FROM notificacoes WHERE telefone = ? AND lida = 0 ORDER BY criadoEm DESC LIMIT 50')
+      .bind(telefone)
+      .all<NotificacaoRecord>();
+    
+    if (!result) {
+      console.warn('⚠️ Resultado da query de notificações é null/undefined');
+      return [];
+    }
+    
+    if (!result.results) {
+      console.warn('⚠️ result.results é null/undefined');
+      return [];
+    }
+    
+    // Valida e filtra resultados inválidos
+    return result.results.filter((not: any) => {
+      if (!not || typeof not !== 'object') {
+        return false;
+      }
+      // Valida campos obrigatórios
+      return not.hasOwnProperty('telefone') && not.hasOwnProperty('tipo');
+    });
+  } catch (error: any) {
+    console.error('❌ Erro ao buscar notificações:', error);
+    console.error('   Stack:', error.stack);
+    return [];
+  }
+}
+
+// Marca notificações como lidas
+export async function marcarNotificacoesComoLidasD1(
+  db: D1Database,
+  telefone: string,
+  ids?: number[]
+): Promise<number> {
+  await criarTabelaNotificacoes(db);
+  
+  if (ids && ids.length > 0) {
+    const placeholders = ids.map(() => '?').join(',');
+    const result = await db
+      .prepare(`UPDATE notificacoes SET lida = 1 WHERE telefone = ? AND id IN (${placeholders})`)
+      .bind(telefone, ...ids)
+      .run();
+    return result.meta.changes || 0;
+  } else {
+    // Marca todas como lidas
+    const result = await db
+      .prepare('UPDATE notificacoes SET lida = 1 WHERE telefone = ? AND lida = 0')
+      .bind(telefone)
+      .run();
+    return result.meta.changes || 0;
+  }
+}
+
+// Remove notificações antigas (mais de 24 horas)
+export async function limparNotificacoesAntigasD1(db: D1Database): Promise<number> {
+  await criarTabelaNotificacoes(db);
+  
+  const result = await db
+    .prepare('DELETE FROM notificacoes WHERE lida = 1 AND criadoEm < datetime("now", "-1 day")')
+    .run();
+  
+  return result.meta.changes || 0;
+}
+
+// ========== CÓDIGOS DE VERIFICAÇÃO ==========
+
+export interface CodigoVerificacaoRecord {
+  telefone: string;
+  codigo: string;
+  criadoEm: string;
+  expiraEm: string;
+}
+
+// Cria a tabela de códigos de verificação se não existir
+export async function criarTabelaCodigosVerificacao(db: D1Database): Promise<void> {
+  try {
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS codigos_verificacao (
+        telefone TEXT NOT NULL PRIMARY KEY,
+        codigo TEXT NOT NULL,
+        criadoEm TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        expiraEm TEXT NOT NULL
+      )
+    `).run();
+    
+    // Cria índice para limpeza de códigos expirados
+    try {
+      await db.prepare('CREATE INDEX IF NOT EXISTS idx_codigos_verificacao_expiraEm ON codigos_verificacao(expiraEm)').run();
+    } catch (e) {
+      // Índice pode já existir, ignora erro
+      console.log('   ℹ️  Índice idx_codigos_verificacao_expiraEm já existe ou erro ao criar');
+    }
+  } catch (error: any) {
+    // Se a tabela já existe, não é um erro crítico
+    if (error.message && error.message.includes('already exists')) {
+      console.log('   ℹ️  Tabela codigos_verificacao já existe');
+      return;
+    }
+    console.error('❌ Erro ao criar tabela codigos_verificacao:', error);
+    throw error;
+  }
+}
+
+// Salva um código de verificação no D1
+export async function salvarCodigoVerificacaoD1(
+  db: D1Database,
+  telefone: string,
+  codigo: string,
+  expiraEm: Date
+): Promise<void> {
+  await criarTabelaCodigosVerificacao(db);
+  
+  // Remove código antigo se existir (upsert)
+  await db
+    .prepare('DELETE FROM codigos_verificacao WHERE telefone = ?')
+    .bind(telefone)
+    .run();
+  
+  // Insere novo código
+  await db
+    .prepare('INSERT INTO codigos_verificacao (telefone, codigo, criadoEm, expiraEm) VALUES (?, ?, CURRENT_TIMESTAMP, ?)')
+    .bind(telefone, codigo, expiraEm.toISOString())
+    .run();
+  
+  console.log(`✅ D1: Código de verificação salvo para ${telefone}: ${codigo} (expira em ${expiraEm.toLocaleString('pt-BR')})`);
+}
+
+// Busca um código de verificação no D1
+export async function buscarCodigoVerificacaoD1(
+  db: D1Database,
+  telefone: string
+): Promise<CodigoVerificacaoRecord | null> {
+  await criarTabelaCodigosVerificacao(db);
+  
+  const result = await db
+    .prepare('SELECT * FROM codigos_verificacao WHERE telefone = ?')
+    .bind(telefone)
+    .first<CodigoVerificacaoRecord>();
+  
+  return result || null;
+}
+
+// Verifica e remove um código de verificação do D1
+export async function verificarCodigoD1(
+  db: D1Database,
+  telefone: string,
+  codigo: string
+): Promise<boolean> {
+  await criarTabelaCodigosVerificacao(db);
+  
+  const codigoSalvo = await buscarCodigoVerificacaoD1(db, telefone);
+  
+  if (!codigoSalvo) {
+    // Tenta buscar com variações do telefone
+    const telefoneSemWhatsapp = telefone.replace('whatsapp:', '');
+    const telefoneComWhatsapp = telefone.startsWith('whatsapp:') ? telefone : `whatsapp:${telefone}`;
+    const telefoneSemMais = telefone.replace(/\+/g, '');
+    
+    const variacoes = [telefoneSemWhatsapp, telefoneComWhatsapp, telefoneSemMais];
+    for (const variacao of variacoes) {
+      const codigoVariacao = await buscarCodigoVerificacaoD1(db, variacao);
+      if (codigoVariacao) {
+        // Move o código para o formato correto
+        await db
+          .prepare('UPDATE codigos_verificacao SET telefone = ? WHERE telefone = ?')
+          .bind(telefone, variacao)
+          .run();
+        
+        // Continua a verificação
+        const codigoSalvoCorrigido = await buscarCodigoVerificacaoD1(db, telefone);
+        if (!codigoSalvoCorrigido) return false;
+        
+        // Verifica se expirou
+        if (new Date() > new Date(codigoSalvoCorrigido.expiraEm)) {
+          await db
+            .prepare('DELETE FROM codigos_verificacao WHERE telefone = ?')
+            .bind(telefone)
+            .run();
+          console.log(`❌ Código expirado para ${telefone}`);
+          return false;
+        }
+        
+        // Verifica se o código está correto
+        const codigoNormalizado = String(codigo).trim().replace(/\s/g, '');
+        if (codigoSalvoCorrigido.codigo !== codigoNormalizado) {
+          console.log(`❌ Código incorreto para ${telefone}. Esperado: "${codigoSalvoCorrigido.codigo}", Recebido: "${codigoNormalizado}"`);
+          return false;
+        }
+        
+        // Código válido - remove
+        await db
+          .prepare('DELETE FROM codigos_verificacao WHERE telefone = ?')
+          .bind(telefone)
+          .run();
+        console.log(`✅ Código verificado com sucesso para ${telefone}`);
+        return true;
+      }
+    }
+    
+    console.log(`❌ Nenhum código encontrado para "${telefone}"`);
+    return false;
+  }
+  
+  // Verifica se expirou
+  if (new Date() > new Date(codigoSalvo.expiraEm)) {
+    await db
+      .prepare('DELETE FROM codigos_verificacao WHERE telefone = ?')
+      .bind(telefone)
+      .run();
+    console.log(`❌ Código expirado para ${telefone}`);
+    return false;
+  }
+  
+  // Verifica se o código está correto
+  const codigoNormalizado = String(codigo).trim().replace(/\s/g, '');
+  if (codigoSalvo.codigo !== codigoNormalizado) {
+    console.log(`❌ Código incorreto para ${telefone}. Esperado: "${codigoSalvo.codigo}", Recebido: "${codigoNormalizado}"`);
+    return false;
+  }
+  
+  // Código válido - remove
+  await db
+    .prepare('DELETE FROM codigos_verificacao WHERE telefone = ?')
+    .bind(telefone)
+    .run();
+  console.log(`✅ Código verificado com sucesso para ${telefone}`);
+  return true;
+}
+
+// Remove códigos expirados (limpeza periódica)
+export async function limparCodigosExpiradosD1(db: D1Database): Promise<number> {
+  await criarTabelaCodigosVerificacao(db);
+  
+  const result = await db
+    .prepare('DELETE FROM codigos_verificacao WHERE expiraEm < CURRENT_TIMESTAMP')
+    .run();
+  
+  const removidos = result.meta.changes || 0;
+  if (removidos > 0) {
+    console.log(`🧹 D1: ${removidos} código(s) expirado(s) removido(s)`);
+  }
+  
+  return removidos;
+}
+
+// ========== TEMPLATES ==========
+
+export interface TemplateRecord {
+  id?: number;
+  telefone: string;
+  nome: string;
+  tipo: string; // 'dark', 'light', 'custom'
+  corPrimaria: string;
+  corSecundaria: string;
+  corDestaque: string;
+  corFundo: string;
+  corTexto: string;
+  ativo: number; // 0 = false, 1 = true
+  criadoEm: string;
+  atualizadoEm: string;
+}
+
+// Cria templates padrão se não existirem
+export async function criarTemplatesPadraoD1(
+  db: D1Database,
+  telefone: string
+): Promise<void> {
+  try {
+    const variacoes = telefoneVariacoes(telefone);
+    const preferida = variacoes[0];
+    
+    // Verifica se já existem templates padrão (dark e light) para este usuário
+    // Verifica todas as variações do telefone para evitar duplicatas
+    const templatesDark = await db
+      .prepare(`SELECT id FROM templates WHERE telefone IN (${variacoes.map(() => '?').join(',')}) AND tipo = 'dark'`)
+      .bind(...variacoes)
+      .all<TemplateRecord>();
+    
+    const templatesLight = await db
+      .prepare(`SELECT id FROM templates WHERE telefone IN (${variacoes.map(() => '?').join(',')}) AND tipo = 'light'`)
+      .bind(...variacoes)
+      .all<TemplateRecord>();
+    
+    // Se já existem ambos os templates padrão, não cria novamente
+    if (templatesDark.results && templatesDark.results.length > 0 && 
+        templatesLight.results && templatesLight.results.length > 0) {
+      return; // Já existem templates padrão
+    }
+    
+    // Se existe apenas um dos templates, cria o que falta
+    const temDark = templatesDark.results && templatesDark.results.length > 0;
+    const temLight = templatesLight.results && templatesLight.results.length > 0;
+    
+    let templateLightId: number | null = null;
+    
+    // Cria template Dark se não existir
+    if (!temDark) {
+      await db
+        .prepare(`
+          INSERT INTO templates (telefone, nome, tipo, corPrimaria, corSecundaria, corDestaque, corFundo, corTexto, ativo, criadoEm, atualizadoEm)
+          VALUES (?, 'Dark', 'dark', '#3B82F6', '#8B5CF6', '#10B981', '#1E293B', '#F1F5F9', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        `)
+        .bind(preferida)
+        .run();
+    }
+    
+    // Cria template Light se não existir
+    if (!temLight) {
+      const resultLight = await db
+        .prepare(`
+          INSERT INTO templates (telefone, nome, tipo, corPrimaria, corSecundaria, corDestaque, corFundo, corTexto, ativo, criadoEm, atualizadoEm)
+          VALUES (?, 'Light', 'light', '#3B82F6', '#8B5CF6', '#10B981', '#F9FAFB', '#111827', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        `)
+        .bind(preferida)
+        .run();
+      
+      templateLightId = Number(resultLight.meta.last_row_id);
+    } else {
+      // Se já existe Light, busca o ID para atualizar o usuário
+      const lightExistente = templatesLight.results[0];
+      if (lightExistente && lightExistente.id) {
+        templateLightId = lightExistente.id;
+      }
+    }
+    
+    // Atualiza o usuário com o template ativo (Light) se não tiver um template ativo definido
+    if (templateLightId) {
+      const usuario = await db
+        .prepare('SELECT templateAtivoId FROM usuarios WHERE telefone = ?')
+        .bind(preferida)
+        .first<{ templateAtivoId: number | null }>();
+      
+      if (!usuario || !usuario.templateAtivoId) {
+        await db
+          .prepare('UPDATE usuarios SET templateAtivoId = ? WHERE telefone = ?')
+          .bind(templateLightId, preferida)
+          .run();
+      }
+    }
+    
+    if (!temDark || !temLight) {
+      console.log(`✅ Templates padrão criados/verificados para: ${preferida}`);
+    }
+  } catch (error: any) {
+    // Se a tabela não existir, ignora o erro (será criada depois)
+    if (error.message && error.message.includes('no such table')) {
+      console.warn('⚠️ Tabela templates ainda não existe, será criada automaticamente');
+      return;
+    }
+    throw error;
+  }
+}
+
+// Remove templates duplicados (mantém apenas o mais antigo de cada tipo padrão)
+export async function limparTemplatesDuplicadosD1(
+  db: D1Database,
+  telefone: string
+): Promise<number> {
+  try {
+    const variacoes = telefoneVariacoes(telefone);
+    let removidos = 0;
+    
+    // Para cada tipo padrão (dark e light), mantém apenas o mais antigo
+    for (const tipo of ['dark', 'light']) {
+      const templates = await db
+        .prepare(`SELECT id, criadoEm FROM templates WHERE telefone IN (${variacoes.map(() => '?').join(',')}) AND tipo = ? ORDER BY criadoEm ASC`)
+        .bind(...variacoes, tipo)
+        .all<{ id: number; criadoEm: string }>();
+      
+      if (templates.results && templates.results.length > 1) {
+        // Mantém o primeiro (mais antigo) e remove os demais
+        const manterId = templates.results[0].id;
+        const idsParaRemover = templates.results.slice(1).map(t => t.id);
+        
+        for (const id of idsParaRemover) {
+          await db
+            .prepare('DELETE FROM templates WHERE id = ?')
+            .bind(id)
+            .run();
+          removidos++;
+        }
+        
+        console.log(`🧹 Removidos ${idsParaRemover.length} templates duplicados do tipo '${tipo}' para ${telefone}`);
+      }
+    }
+    
+    return removidos;
+  } catch (error: any) {
+    console.error('❌ Erro ao limpar templates duplicados:', error);
+    return 0;
+  }
+}
+
+export async function buscarTemplatesD1(
+  db: D1Database,
+  telefone: string
+): Promise<TemplateRecord[]> {
+  // Limpa templates duplicados antes de garantir que os padrão existem
+  await limparTemplatesDuplicadosD1(db, telefone);
+  
+  // Garante que os templates padrão existem
+  await criarTemplatesPadraoD1(db, telefone);
+  
+  const variacoes = telefoneVariacoes(telefone);
+  
+  const templates = await db
+    .prepare(`
+      SELECT * FROM templates 
+      WHERE telefone IN (${variacoes.map(() => '?').join(',')})
+      ORDER BY ativo DESC, tipo ASC, criadoEm ASC
+    `)
+    .bind(...variacoes)
+    .all<TemplateRecord>();
+  
+  return templates.results || [];
+}
+
+export async function criarTemplateD1(
+  db: D1Database,
+  telefone: string,
+  dados: {
+    nome: string;
+    corPrimaria: string;
+    corSecundaria: string;
+    corDestaque: string;
+    corFundo: string;
+    corTexto: string;
+  }
+): Promise<number> {
+  const variacoes = telefoneVariacoes(telefone);
+  const preferida = variacoes[0];
+  
+  // Valida formato hex das cores
+  const hexRegex = /^#([A-Fa-f0-9]{6}|[A-Fa-f0-9]{3})$/;
+  const cores = [dados.corPrimaria, dados.corSecundaria, dados.corDestaque, dados.corFundo, dados.corTexto];
+  for (const cor of cores) {
+    if (!cor || !hexRegex.test(cor)) {
+      throw new Error('Todas as cores devem estar no formato hexadecimal (ex: #3B82F6)');
+    }
+  }
+  
+  const result = await db
+    .prepare(`
+      INSERT INTO templates (telefone, nome, tipo, corPrimaria, corSecundaria, corDestaque, corFundo, corTexto, ativo, criadoEm, atualizadoEm)
+      VALUES (?, ?, 'custom', ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    `)
+    .bind(
+      preferida,
+      dados.nome.trim(),
+      dados.corPrimaria,
+      dados.corSecundaria,
+      dados.corDestaque,
+      dados.corFundo,
+      dados.corTexto
+    )
+    .run();
+  
+  return Number(result.meta.last_row_id);
+}
+
+export async function atualizarTemplateD1(
+  db: D1Database,
+  id: number,
+  telefone: string,
+  dados: {
+    nome?: string;
+    corPrimaria?: string;
+    corSecundaria?: string;
+    corDestaque?: string;
+    corFundo?: string;
+    corTexto?: string;
+  }
+): Promise<boolean> {
+  const template = await db
+    .prepare('SELECT * FROM templates WHERE id = ?')
+    .bind(id)
+    .first<TemplateRecord>();
+  
+  if (!template) {
+    throw new Error('Template não encontrado');
+  }
+  
+  // Não permite editar templates padrão (dark e light)
+  if (template.tipo !== 'custom') {
+    throw new Error('Não é possível editar templates padrão');
+  }
+  
+  // Verifica se o template pertence ao usuário
+  const variacoes = telefoneVariacoes(telefone);
+  const telefoneCorresponde = variacoes.includes(template.telefone);
+  
+  if (!telefoneCorresponde) {
+    throw new Error('Você não tem permissão para atualizar este template');
+  }
+  
+  const updates: string[] = [];
+  const params: Array<string> = [];
+  
+  // Valida formato hex das cores se fornecidas
+  const hexRegex = /^#([A-Fa-f0-9]{6}|[A-Fa-f0-9]{3})$/;
+  
+  if (dados.nome !== undefined) {
+    updates.push('nome = ?');
+    params.push(dados.nome.trim());
+  }
+  if (dados.corPrimaria !== undefined) {
+    if (!hexRegex.test(dados.corPrimaria)) {
+      throw new Error('Cor primária deve estar no formato hexadecimal');
+    }
+    updates.push('corPrimaria = ?');
+    params.push(dados.corPrimaria);
+  }
+  if (dados.corSecundaria !== undefined) {
+    if (!hexRegex.test(dados.corSecundaria)) {
+      throw new Error('Cor secundária deve estar no formato hexadecimal');
+    }
+    updates.push('corSecundaria = ?');
+    params.push(dados.corSecundaria);
+  }
+  if (dados.corDestaque !== undefined) {
+    if (!hexRegex.test(dados.corDestaque)) {
+      throw new Error('Cor de destaque deve estar no formato hexadecimal');
+    }
+    updates.push('corDestaque = ?');
+    params.push(dados.corDestaque);
+  }
+  if (dados.corFundo !== undefined) {
+    if (!hexRegex.test(dados.corFundo)) {
+      throw new Error('Cor de fundo deve estar no formato hexadecimal');
+    }
+    updates.push('corFundo = ?');
+    params.push(dados.corFundo);
+  }
+  if (dados.corTexto !== undefined) {
+    if (!hexRegex.test(dados.corTexto)) {
+      throw new Error('Cor de texto deve estar no formato hexadecimal');
+    }
+    updates.push('corTexto = ?');
+    params.push(dados.corTexto);
+  }
+  
+  if (updates.length === 0) return false;
+  
+  updates.push('atualizadoEm = CURRENT_TIMESTAMP');
+  
+  await db
+    .prepare(`UPDATE templates SET ${updates.join(', ')} WHERE id = ?`)
+    .bind(...params, id)
+    .run();
+  
+  return true;
+}
+
+export async function removerTemplateD1(
+  db: D1Database,
+  id: number,
+  telefone: string
+): Promise<boolean> {
+  const template = await db
+    .prepare('SELECT * FROM templates WHERE id = ?')
+    .bind(id)
+    .first<TemplateRecord>();
+  
+  if (!template) {
+    throw new Error('Template não encontrado');
+  }
+  
+  // Não permite deletar templates padrão
+  if (template.tipo !== 'custom') {
+    throw new Error('Não é possível deletar templates padrão');
+  }
+  
+  // Verifica se o template pertence ao usuário
+  const variacoes = telefoneVariacoes(telefone);
+  const telefoneCorresponde = variacoes.includes(template.telefone);
+  
+  if (!telefoneCorresponde) {
+    throw new Error('Você não tem permissão para remover este template');
+  }
+  
+  const result = await db
+    .prepare('DELETE FROM templates WHERE id = ?')
+    .bind(id)
+    .run();
+  
+  return (result.meta.changes || 0) > 0;
+}
+
+export async function ativarTemplateD1(
+  db: D1Database,
+  id: number,
+  telefone: string
+): Promise<boolean> {
+  try {
+    const template = await db
+      .prepare('SELECT * FROM templates WHERE id = ?')
+      .bind(id)
+      .first<TemplateRecord>();
+    
+    if (!template) {
+      throw new Error('Template não encontrado');
+    }
+    
+    // Verifica se o template pertence ao usuário
+    const variacoes = telefoneVariacoes(telefone);
+    const telefoneCorresponde = variacoes.includes(template.telefone);
+    
+    if (!telefoneCorresponde) {
+      throw new Error('Você não tem permissão para ativar este template');
+    }
+    
+    // Desativa todos os templates do usuário
+    await db
+      .prepare(`UPDATE templates SET ativo = 0 WHERE telefone IN (${variacoes.map(() => '?').join(',')})`)
+      .bind(...variacoes)
+      .run();
+    
+    // Ativa o template selecionado
+    await db
+      .prepare('UPDATE templates SET ativo = 1 WHERE id = ?')
+      .bind(id)
+      .run();
+    
+    // Atualiza o usuário com o template ativo
+    await db
+      .prepare(`UPDATE usuarios SET templateAtivoId = ? WHERE telefone IN (${variacoes.map(() => '?').join(',')})`)
+      .bind(id, ...variacoes)
+      .run();
+    
+    return true;
+  } catch (error: any) {
+    console.error('❌ Erro ao ativar template:', error);
+    if (error.message && error.message.includes('no such table')) {
+      throw new Error('Tabela templates não existe no banco de dados. Por favor, aguarde alguns minutos para a propagação.');
+    }
+    throw error;
+  }
+}
+
+// ========== CARTEIRAS ==========
+
+export interface CarteiraRecord {
+  id?: number;
+  telefone: string;
+  nome: string;
+  descricao?: string | null;
+  tipo?: string; // "debito" ou "credito"
+  limiteCredito?: number | null;
+  diaPagamento?: number | null;
+  padrao: number; // 0 = false, 1 = true
+  ativo: number; // 0 = false, 1 = true
+  criadoEm: string;
+  atualizadoEm: string;
+}
+
+export interface CarteiraAliasRecord {
+  id?: number;
+  telefone: string;
+  carteiraId: number;
+  alias: string;
+  frequenciaUso: number;
+  ultimoUso?: string;
+}
+
+interface PreferenciasFinanceirasRecord {
+  telefone: string;
+  ultimaCarteiraId?: number | null;
+  ultimaAtualizacao?: string;
+}
+
+export interface CarteiraResolvida {
+  carteira: CarteiraRecord | null;
+  origem: string;
+  score: number;
+  aliasUsado?: string;
+}
+
+// Garante que apenas uma carteira seja padrão por vez
+async function garantirApenasUmaCarteiraPadraoD1(
+  db: D1Database,
+  telefone: string,
+  carteiraIdExcluir?: number
+): Promise<void> {
+  try {
+    const variacoes = telefoneVariacoes(telefone);
+    
+    // Busca todas as carteiras padrão do usuário
+    const carteirasPadrao = await db
+      .prepare(`SELECT id FROM carteiras WHERE telefone IN (${variacoes.map(() => '?').join(',')}) AND padrao = 1 AND ativo = 1${carteiraIdExcluir ? ' AND id != ?' : ''}`)
+      .bind(...variacoes, ...(carteiraIdExcluir ? [carteiraIdExcluir] : []))
+      .all<{ id: number }>();
+    
+    // Se há mais de uma carteira padrão, mantém apenas a primeira (mais antiga)
+    if (carteirasPadrao.results && carteirasPadrao.results.length > 1) {
+      const manterId = carteirasPadrao.results[0].id;
+      const idsParaRemover = carteirasPadrao.results.slice(1).map(c => c.id);
+      
+      for (const id of idsParaRemover) {
+        await db
+          .prepare('UPDATE carteiras SET padrao = 0, atualizadoEm = CURRENT_TIMESTAMP WHERE id = ?')
+          .bind(id)
+          .run();
+      }
+      
+      // Atualiza o usuário para apontar para a carteira mantida
+      await db
+        .prepare(`UPDATE usuarios SET carteiraPadraoId = ? WHERE telefone IN (${variacoes.map(() => '?').join(',')})`)
+        .bind(manterId, ...variacoes)
+        .run();
+      
+      console.log(`🔧 Corrigido: ${idsParaRemover.length} carteira(s) duplicada(s) removida(s) do padrão`);
+    }
+  } catch (error: any) {
+    console.error('❌ Erro ao garantir apenas uma carteira padrão:', error);
+    // Não lança erro, apenas loga
+  }
+}
+
+export async function buscarCarteirasD1(
+  db: D1Database,
+  telefone: string
+): Promise<CarteiraRecord[]> {
+  try {
+    const variacoes = telefoneVariacoes(telefone);
+    
+    // Garante que apenas uma carteira seja padrão antes de buscar
+    await garantirApenasUmaCarteiraPadraoD1(db, telefone);
+    
+    const carteiras = await db
+      .prepare(`
+        SELECT * FROM carteiras 
+        WHERE telefone IN (${variacoes.map(() => '?').join(',')}) AND ativo = 1
+        ORDER BY padrao DESC, criadoEm ASC
+      `)
+      .bind(...variacoes)
+      .all<CarteiraRecord>();
+    
+    return carteiras.results || [];
+  } catch (error: any) {
+    console.error('❌ Erro ao buscar carteiras:', error);
+    // Se a tabela não existir, retorna array vazio em vez de lançar erro
+    if (error.message && error.message.includes('no such table')) {
+      console.warn('⚠️ Tabela carteiras não existe ainda, retornando array vazio');
+      return [];
+    }
+    throw error;
+  }
+}
+
+export async function buscarCarteiraPorIdD1(
+  db: D1Database,
+  id: number,
+  telefone: string
+): Promise<CarteiraRecord | null> {
+  try {
+    const variacoes = telefoneVariacoes(telefone);
+    
+    for (const variacao of variacoes) {
+      const carteira = await db
+        .prepare('SELECT * FROM carteiras WHERE id = ? AND telefone = ? AND ativo = 1')
+        .bind(id, variacao)
+        .first<CarteiraRecord>();
+      
+      if (carteira) return carteira;
+    }
+    
+    return null;
+  } catch (error: any) {
+    console.error('❌ Erro ao buscar carteira por ID:', error);
+    if (error.message && error.message.includes('no such table')) {
+      throw new Error('Tabela carteiras não existe no banco de dados. Por favor, aguarde alguns minutos para a propagação.');
+    }
+    throw error;
+  }
+}
+
+export async function buscarCarteiraPadraoD1(
+  db: D1Database,
+  telefone: string
+): Promise<CarteiraRecord | null> {
+  const variacoes = telefoneVariacoes(telefone);
+  const preferida = variacoes[0];
+  
+  // Primeiro tenta buscar pela carteira padrão do usuário
+  const usuario = await db
+    .prepare('SELECT carteiraPadraoId FROM usuarios WHERE telefone = ?')
+    .bind(preferida)
+    .first<{ carteiraPadraoId: number | null }>();
+  
+  if (usuario?.carteiraPadraoId) {
+    const carteira = await buscarCarteiraPorIdD1(db, usuario.carteiraPadraoId, telefone);
+    if (carteira) return carteira;
+  }
+  
+  // Se não encontrou, busca pela primeira carteira marcada como padrão
+  for (const variacao of variacoes) {
+    const carteiraPadrao = await db
+      .prepare('SELECT * FROM carteiras WHERE telefone = ? AND padrao = 1 AND ativo = 1 LIMIT 1')
+      .bind(variacao)
+      .first<CarteiraRecord>();
+    
+    if (carteiraPadrao) return carteiraPadrao;
+  }
+  
+  // Se não encontrou, retorna a primeira carteira ativa
+  for (const variacao of variacoes) {
+    const carteira = await db
+      .prepare('SELECT * FROM carteiras WHERE telefone = ? AND ativo = 1 ORDER BY criadoEm ASC LIMIT 1')
+      .bind(variacao)
+      .first<CarteiraRecord>();
+    
+    if (carteira) return carteira;
+  }
+  
+  return null;
+}
+
+async function buscarAliasesCarteiraD1(
+  db: D1Database,
+  telefone: string
+): Promise<CarteiraAliasRecord[]> {
+  try {
+    const variacoes = telefoneVariacoes(telefone);
+    const aliases = await db
+      .prepare(`SELECT * FROM carteira_aliases WHERE telefone IN (${variacoes.map(() => '?').join(',')})`)
+      .bind(...variacoes)
+      .all<CarteiraAliasRecord>();
+    return aliases.results || [];
+  } catch (error: any) {
+    if (error.message && error.message.includes('no such table')) {
+      return [];
+    }
+    console.error('❌ Erro ao buscar aliases de carteira:', error);
+    return [];
+  }
+}
+
+export async function registrarAliasCarteiraD1(
+  db: D1Database,
+  telefone: string,
+  carteiraId: number,
+  alias: string | undefined | null
+): Promise<void> {
+  try {
+    const aliasNormalizado = normalizarTextoCarteira(alias || '');
+    if (!aliasNormalizado) return;
+
+    const variacoes = telefoneVariacoes(telefone);
+    const preferida = variacoes[0];
+
+    await db
+      .prepare(`
+        INSERT INTO carteira_aliases (telefone, carteiraId, alias, frequenciaUso, ultimoUso)
+        VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)
+        ON CONFLICT(telefone, alias) DO UPDATE SET 
+          carteiraId = excluded.carteiraId,
+          frequenciaUso = carteira_aliases.frequenciaUso + 1,
+          ultimoUso = CURRENT_TIMESTAMP
+      `)
+      .bind(preferida, carteiraId, aliasNormalizado)
+      .run();
+  } catch (error: any) {
+    if (error.message && error.message.includes('no such table')) {
+      console.warn('⚠️ Tabela carteira_aliases não existe ainda, ignorando registro de alias.');
+      return;
+    }
+    console.error('❌ Erro ao registrar alias de carteira:', error);
+  }
+}
+
+export async function registrarUltimaCarteiraUsadaD1(
+  db: D1Database,
+  telefone: string,
+  carteiraId: number | null
+): Promise<void> {
+  try {
+    if (!carteiraId) return;
+    const variacoes = telefoneVariacoes(telefone);
+    const preferida = variacoes[0];
+
+    await db
+      .prepare(`
+        INSERT INTO preferencias_financeiras (telefone, ultimaCarteiraId, ultimaAtualizacao)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(telefone) DO UPDATE SET 
+          ultimaCarteiraId = excluded.ultimaCarteiraId,
+          ultimaAtualizacao = CURRENT_TIMESTAMP
+      `)
+      .bind(preferida, carteiraId)
+      .run();
+  } catch (error: any) {
+    if (error.message && error.message.includes('no such table')) {
+      console.warn('⚠️ Tabela preferencias_financeiras não existe ainda, ignorando última carteira.');
+      return;
+    }
+    console.error('❌ Erro ao registrar última carteira usada:', error);
+  }
+}
+
+export async function obterUltimaCarteiraUsadaD1(
+  db: D1Database,
+  telefone: string
+): Promise<CarteiraRecord | null> {
+  try {
+    const variacoes = telefoneVariacoes(telefone);
+    const pref = await db
+      .prepare(
+        `SELECT ultimaCarteiraId FROM preferencias_financeiras 
+         WHERE telefone IN (${variacoes.map(() => '?').join(',')})
+         ORDER BY ultimaAtualizacao DESC LIMIT 1`
+      )
+      .bind(...variacoes)
+      .first<PreferenciasFinanceirasRecord>();
+
+    if (pref?.ultimaCarteiraId) {
+      const carteira = await buscarCarteiraPorIdD1(db, pref.ultimaCarteiraId, telefone);
+      return carteira || null;
+    }
+    return null;
+  } catch (error: any) {
+    if (error.message && error.message.includes('no such table')) {
+      return null;
+    }
+    console.error('❌ Erro ao obter última carteira usada:', error);
+    return null;
+  }
+}
+
+export async function resolverCarteiraPorTextoD1(
+  db: D1Database,
+  telefone: string,
+  opcoes: {
+    nomeInformado?: string;
+    textoOriginal?: string;
+    tipoPreferido?: 'debito' | 'credito';
+  }
+): Promise<CarteiraResolvida> {
+  const carteiras = await buscarCarteirasD1(db, telefone);
+  if (!carteiras.length) {
+    return { carteira: null, origem: 'nenhuma-carteira', score: 0 };
+  }
+
+  const aliases = await buscarAliasesCarteiraD1(db, telefone);
+  const alvoTexto = opcoes.nomeInformado || opcoes.textoOriginal || '';
+  const alvoNormalizado = normalizarTextoCarteira(alvoTexto);
+  
+  // Extrai palavras do texto para busca mais precisa
+  const palavrasTexto = alvoNormalizado.split(/\s+/).filter(p => p.length >= 3); // palavras com 3+ caracteres
+
+  let melhor: CarteiraResolvida = { carteira: null, origem: 'nenhuma', score: 0 };
+
+  if (alvoTexto) {
+    for (const carteira of carteiras) {
+      const candidatos = [
+        carteira.nome,
+        ...aliases.filter(a => a.carteiraId === carteira.id).map(a => a.alias),
+      ];
+
+      for (const candidato of candidatos) {
+        const candNorm = normalizarTextoCarteira(candidato);
+        
+        // Verifica se o candidato aparece como substring no texto (caso mais comum)
+        const substringHit = alvoNormalizado.includes(candNorm);
+        // Verifica se alguma palavra do texto está no candidato ou vice-versa
+        const palavraMatch = palavrasTexto.some(palavra => 
+          candNorm.includes(palavra) || palavra.includes(candNorm)
+        );
+        
+        // Score base: se há substring exata, score alto; senão usa similaridade
+        let baseScore = 0;
+        if (substringHit) {
+          baseScore = 0.8; // Match exato de substring
+        } else if (palavraMatch) {
+          baseScore = 0.6; // Match de palavra
+        } else {
+          baseScore = scoreSemelhancaCarteira(alvoTexto, candidato);
+        }
+        
+        const bonusSubstring = substringHit ? 0.2 : (palavraMatch ? 0.15 : 0);
+        const bonusTipo = opcoes.tipoPreferido && carteira.tipo === opcoes.tipoPreferido ? 0.07 : 0;
+        const aliasFreq = aliases.find(a => a.alias === candNorm && a.carteiraId === carteira.id)?.frequenciaUso ?? 0;
+        const bonusFrequencia = Math.min(aliasFreq / 20, 0.1); // até +0.1
+        const score = baseScore + bonusSubstring + bonusTipo + bonusFrequencia;
+
+        if (score > melhor.score) {
+          melhor = {
+            carteira,
+            origem: candidato === carteira.nome ? 'nome' : 'alias',
+            score,
+            aliasUsado: candidato,
+          };
+        }
+      }
+    }
+
+    // Log para debug
+    if (melhor.carteira) {
+      console.log(`🎯 Resolver carteira: encontrou "${melhor.carteira.nome}" (score: ${melhor.score.toFixed(2)}, origem: ${melhor.origem})`);
+    }
+
+    // Aceita match se score >= 0.3 (mais permissivo) ou se há substring exata
+    if (melhor.carteira && (melhor.score >= 0.3 || alvoNormalizado.includes(normalizarTextoCarteira(melhor.carteira.nome)))) {
+      return melhor;
+    }
+  }
+
+  // fallback: última carteira usada
+  const ultima = await obterUltimaCarteiraUsadaD1(db, telefone);
+  if (ultima) {
+    return { carteira: ultima, origem: 'ultima-carteira', score: 0.5 };
+  }
+
+  // fallback: carteira padrão
+  const padrao = await buscarCarteiraPadraoD1(db, telefone);
+  if (padrao) {
+    return { carteira: padrao, origem: 'carteira-padrao', score: 0.45 };
+  }
+
+  // fallback final: primeira carteira
+  return { carteira: carteiras[0], origem: 'primeira-carteira', score: 0.3 };
+}
+
+export async function criarCarteiraD1(
+  db: D1Database,
+  telefone: string,
+  dados: {
+    nome: string;
+    descricao?: string;
+    padrao?: boolean;
+    tipo?: string;
+    limiteCredito?: number | null;
+    diaPagamento?: number | null;
+  }
+): Promise<number> {
+  const variacoes = telefoneVariacoes(telefone);
+  const preferida = variacoes[0];
+  
+  // Se está marcando como padrão, remove o padrão de TODAS as outras (garante apenas uma padrão)
+  if (dados.padrao === true) {
+    // Remove padrão de todas as carteiras do usuário
+    await db
+      .prepare(`UPDATE carteiras SET padrao = 0 WHERE telefone IN (${variacoes.map(() => '?').join(',')})`)
+      .bind(...variacoes)
+      .run();
+    
+    // Limpa a referência do usuário temporariamente (será atualizada após criar a carteira)
+    await db
+      .prepare(`UPDATE usuarios SET carteiraPadraoId = NULL WHERE telefone IN (${variacoes.map(() => '?').join(',')})`)
+      .bind(...variacoes)
+      .run();
+  }
+  
+  // Garante que o tipo seja 'credito' ou 'debito', padrão 'debito' apenas se undefined/null/string vazia
+  const tipoFinal = (dados.tipo === 'credito' || dados.tipo === 'debito') ? dados.tipo : 'debito';
+  
+  // Validações para carteira de crédito
+  if (tipoFinal === 'credito') {
+    if (dados.limiteCredito !== undefined && dados.limiteCredito !== null && dados.limiteCredito <= 0) {
+      throw new Error('Limite de crédito deve ser maior que zero para carteiras do tipo crédito');
+    }
+    if (dados.diaPagamento !== undefined && dados.diaPagamento !== null && (dados.diaPagamento < 1 || dados.diaPagamento > 31)) {
+      throw new Error('Dia de pagamento deve ser entre 1 e 31 para carteiras do tipo crédito');
+    }
+  }
+
+  const result = await db
+    .prepare(`
+      INSERT INTO carteiras (telefone, nome, descricao, tipo, limiteCredito, diaPagamento, padrao, ativo, criadoEm, atualizadoEm)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    `)
+    .bind(
+      preferida,
+      dados.nome.trim(),
+      dados.descricao?.trim() || null,
+      tipoFinal,
+      tipoFinal === 'credito' ? (dados.limiteCredito ?? null) : null,
+      tipoFinal === 'credito' ? (dados.diaPagamento ?? null) : null,
+      dados.padrao === true ? 1 : 0
+    )
+    .run();
+  
+  const carteiraId = Number(result.meta.last_row_id);
+  
+  // Se é padrão, atualiza o usuário
+  if (dados.padrao === true) {
+    await db
+      .prepare(`UPDATE usuarios SET carteiraPadraoId = ? WHERE telefone IN (${variacoes.map(() => '?').join(',')})`)
+      .bind(carteiraId, ...variacoes)
+      .run();
+    
+    // Garante que apenas esta carteira seja padrão (limpeza final)
+    await garantirApenasUmaCarteiraPadraoD1(db, telefone, carteiraId);
+  }
+  
+  return carteiraId;
+}
+
+export async function atualizarCarteiraD1(
+  db: D1Database,
+  id: number,
+  telefone: string,
+  dados: {
+    nome?: string;
+    descricao?: string;
+    padrao?: boolean;
+    ativo?: boolean;
+    tipo?: string;
+    limiteCredito?: number | null;
+    diaPagamento?: number | null;
+  }
+): Promise<boolean> {
+  const carteira = await buscarCarteiraPorIdD1(db, id, telefone);
+  if (!carteira) {
+    throw new Error('Carteira não encontrada');
+  }
+  
+  const variacoes = telefoneVariacoes(telefone);
+  
+  // Se está marcando como padrão, remove o padrão de TODAS as outras (garante apenas uma padrão)
+  if (dados.padrao === true) {
+    // Remove padrão de todas as carteiras do usuário (exceto a atual)
+    await db
+      .prepare(`UPDATE carteiras SET padrao = 0 WHERE telefone IN (${variacoes.map(() => '?').join(',')}) AND id != ?`)
+      .bind(...variacoes, id)
+      .run();
+    
+    // Atualiza o usuário para apontar para esta carteira
+    await db
+      .prepare(`UPDATE usuarios SET carteiraPadraoId = ? WHERE telefone IN (${variacoes.map(() => '?').join(',')})`)
+      .bind(id, ...variacoes)
+      .run();
+    
+    // Garante que apenas esta carteira seja padrão (limpeza final)
+    await garantirApenasUmaCarteiraPadraoD1(db, telefone, id);
+  }
+  
+  // Se está desmarcando como padrão (padrao === false) e esta é a única padrão,
+  // marca a primeira outra carteira ativa como padrão
+  if (dados.padrao === false && carteira.padrao === 1) {
+    // Busca outra carteira ativa para ser a nova padrão
+    const outraCarteira = await db
+      .prepare(`SELECT id FROM carteiras WHERE telefone IN (${variacoes.map(() => '?').join(',')}) AND id != ? AND ativo = 1 LIMIT 1`)
+      .bind(...variacoes, id)
+      .first<{ id: number }>();
+    
+    if (outraCarteira) {
+      // Marca a outra carteira como padrão
+      await db
+        .prepare('UPDATE carteiras SET padrao = 1, atualizadoEm = CURRENT_TIMESTAMP WHERE id = ?')
+        .bind(outraCarteira.id)
+        .run();
+      
+      await db
+        .prepare(`UPDATE usuarios SET carteiraPadraoId = ? WHERE telefone IN (${variacoes.map(() => '?').join(',')})`)
+        .bind(outraCarteira.id, ...variacoes)
+        .run();
+    } else {
+      // Se não há outra carteira, não permite desmarcar esta como padrão
+      throw new Error('Não é possível remover a carteira padrão. É necessário ter pelo menos uma carteira padrão.');
+    }
+  }
+  
+  // Validações para carteira de crédito
+  if (dados.tipo === 'credito') {
+    if (dados.limiteCredito !== undefined && dados.limiteCredito !== null && dados.limiteCredito <= 0) {
+      throw new Error('Limite de crédito deve ser maior que zero para carteiras do tipo crédito');
+    }
+    if (dados.diaPagamento !== undefined && dados.diaPagamento !== null && (dados.diaPagamento < 1 || dados.diaPagamento > 31)) {
+      throw new Error('Dia de pagamento deve ser entre 1 e 31 para carteiras do tipo crédito');
+    }
+  }
+
+  const updates: string[] = [];
+  const params: Array<string | number | null> = [];
+  
+  if (dados.nome !== undefined) {
+    updates.push('nome = ?');
+    params.push(dados.nome.trim());
+  }
+  if (dados.descricao !== undefined) {
+    updates.push('descricao = ?');
+    params.push(dados.descricao?.trim() || null);
+  }
+  if (dados.padrao !== undefined) {
+    updates.push('padrao = ?');
+    params.push(dados.padrao ? 1 : 0);
+  }
+  if (dados.ativo !== undefined) {
+    updates.push('ativo = ?');
+    params.push(dados.ativo ? 1 : 0);
+  }
+  
+  // Garante que o tipo seja 'credito' ou 'debito' se fornecido
+  if (dados.tipo !== undefined) {
+    const tipoFinal = (dados.tipo === 'credito' || dados.tipo === 'debito') ? dados.tipo : 'debito';
+    updates.push('tipo = ?');
+    params.push(tipoFinal);
+    
+    if (tipoFinal === 'credito') {
+      if (dados.limiteCredito !== undefined) {
+        updates.push('limiteCredito = ?');
+        params.push(dados.limiteCredito);
+      }
+      if (dados.diaPagamento !== undefined) {
+        updates.push('diaPagamento = ?');
+        params.push(dados.diaPagamento);
+      }
+    } else if (tipoFinal === 'debito') {
+      // Quando muda para débito, sempre limpa os campos de crédito
+      updates.push('limiteCredito = NULL');
+      updates.push('diaPagamento = NULL');
+    }
+  } else {
+    // Se tipo não foi fornecido mas limiteCredito/diaPagamento foram, também atualiza
+    if (dados.limiteCredito !== undefined) {
+      updates.push('limiteCredito = ?');
+      params.push(dados.limiteCredito);
+    }
+    if (dados.diaPagamento !== undefined) {
+      updates.push('diaPagamento = ?');
+      params.push(dados.diaPagamento);
+    }
+  }
+  
+  if (updates.length === 0) return false;
+  
+  updates.push('atualizadoEm = CURRENT_TIMESTAMP');
+  
+  await db
+    .prepare(`UPDATE carteiras SET ${updates.join(', ')} WHERE id = ?`)
+    .bind(...params, id)
+    .run();
+  
+  // Se marcou como padrão, garante que apenas esta seja padrão
+  if (dados.padrao === true) {
+    await garantirApenasUmaCarteiraPadraoD1(db, telefone, id);
+  }
+  
+  return true;
+}
+
+export async function removerCarteiraD1(
+  db: D1Database,
+  id: number,
+  telefone: string
+): Promise<boolean> {
+  try {
+    const carteira = await buscarCarteiraPorIdD1(db, id, telefone);
+    if (!carteira) {
+      throw new Error('Carteira não encontrada');
+    }
+    
+    // Não permite remover a carteira padrão se houver transações
+    if (carteira.padrao === 1) {
+      const transacoes = await db
+        .prepare('SELECT COUNT(*) as count FROM transacoes WHERE carteiraId = ?')
+        .bind(id)
+        .first<{ count: number }>();
+      
+      if (transacoes && transacoes.count > 0) {
+        throw new Error('Não é possível remover a carteira padrão que possui transações');
+      }
+    }
+    
+    // Marca como inativa
+    await db
+      .prepare('UPDATE carteiras SET ativo = 0, atualizadoEm = CURRENT_TIMESTAMP WHERE id = ?')
+      .bind(id)
+      .run();
+    
+    // Se era a carteira padrão, remove a referência do usuário
+    if (carteira.padrao === 1) {
+      const variacoes = telefoneVariacoes(telefone);
+      await db
+        .prepare(`UPDATE usuarios SET carteiraPadraoId = NULL WHERE telefone IN (${variacoes.map(() => '?').join(',')})`)
+        .bind(...variacoes)
+        .run();
+    }
+    
+    return true;
+  } catch (error: any) {
+    console.error('❌ Erro ao remover carteira:', error);
+    // Se a tabela não existir, lança erro mais descritivo
+    if (error.message && error.message.includes('no such table')) {
+      throw new Error('Tabela carteiras não existe no banco de dados. Por favor, aguarde alguns minutos para a propagação ou entre em contato com o suporte.');
+    }
+    throw error;
+  }
+}
+
+export async function definirCarteiraPadraoD1(
+  db: D1Database,
+  id: number,
+  telefone: string
+): Promise<boolean> {
+  const carteira = await buscarCarteiraPorIdD1(db, id, telefone);
+  if (!carteira) {
+    throw new Error('Carteira não encontrada');
+  }
+  
+  const variacoes = telefoneVariacoes(telefone);
+  
+  // Remove o padrão das outras
+  await db
+    .prepare(`UPDATE carteiras SET padrao = 0 WHERE telefone IN (${variacoes.map(() => '?').join(',')}) AND id != ?`)
+    .bind(...variacoes, id)
+    .run();
+  
+  // Marca esta como padrão
+  await db
+    .prepare('UPDATE carteiras SET padrao = 1, atualizadoEm = CURRENT_TIMESTAMP WHERE id = ?')
+    .bind(id)
+    .run();
+  
+  // Atualiza o usuário
+  await db
+    .prepare(`UPDATE usuarios SET carteiraPadraoId = ? WHERE telefone IN (${variacoes.map(() => '?').join(',')})`)
+    .bind(id, ...variacoes)
+    .run();
+  
+  // Garante que apenas esta carteira seja padrão (limpeza final)
+  await garantirApenasUmaCarteiraPadraoD1(db, telefone, id);
+  
+  return true;
+}

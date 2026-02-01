@@ -1,0 +1,556 @@
+import { useState, useEffect } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { FaTimes, FaPlus } from 'react-icons/fa';
+import { CurrencyInputCustom } from './CurrencyInputCustom';
+import { api } from '../services/api';
+import { useToast } from '../contexts/ToastContext';
+import type { Transacao } from '../config';
+
+interface ModalFormularioTransacaoProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onSuccess: () => void;
+  isDark: boolean;
+  categorias: string[];
+  transacaoEditar?: Transacao | null;
+}
+
+export function ModalFormularioTransacao({
+  isOpen,
+  onClose,
+  onSuccess,
+  isDark,
+  categorias,
+  transacaoEditar,
+}: ModalFormularioTransacaoProps) {
+  const { showSuccess, showError } = useToast();
+  const [loading, setLoading] = useState(false);
+  const [carteiras, setCarteiras] = useState<Array<{ id: number; nome: string; padrao: boolean }>>([]);
+  const [carteiraPadrao, setCarteiraPadrao] = useState<number | null>(null);
+  
+  // Função para obter data/hora atual no formato datetime-local (YYYY-MM-DDTHH:mm)
+  const getDataHoraAtual = () => {
+    const agora = new Date();
+    // Ajusta para o fuso horário local
+    const ano = agora.getFullYear();
+    const mes = String(agora.getMonth() + 1).padStart(2, '0');
+    const dia = String(agora.getDate()).padStart(2, '0');
+    const hora = String(agora.getHours()).padStart(2, '0');
+    const minuto = String(agora.getMinutes()).padStart(2, '0');
+    return `${ano}-${mes}-${dia}T${hora}:${minuto}`;
+  };
+
+  // Função para converter datetime-local para formato pt-BR (igual WhatsApp)
+  const formatarDataHoraParaBackend = (dataHoraLocal: string): string => {
+    if (!dataHoraLocal) return new Date().toLocaleString('pt-BR');
+    const data = new Date(dataHoraLocal);
+    return data.toLocaleString('pt-BR');
+  };
+
+  const [formData, setFormData] = useState({
+    descricao: '',
+    valor: 0 as number,
+    categoria: 'outros',
+    tipo: 'saida' as 'entrada' | 'saida',
+    metodo: 'debito' as 'credito' | 'debito',
+    dataHora: getDataHoraAtual(),
+    carteiraId: null as number | null,
+  });
+
+  // Funções auxiliares para arredondar valores
+  const arredondarParaCentavos = (valor: number | undefined | null): number => {
+    if (valor === undefined || valor === null || isNaN(valor)) return 0;
+    return Math.round(valor * 100) / 100;
+  };
+
+  const handleValorChange = (novoValor: number) => {
+    const valorFormatado = arredondarParaCentavos(novoValor);
+    setFormData({
+      ...formData,
+      valor: valorFormatado,
+    });
+  };
+
+  // Carrega carteiras quando o modal abre
+  useEffect(() => {
+    if (isOpen) {
+      const carregarCarteiras = async () => {
+        try {
+          const response = await api.buscarCarteiras();
+          if (response.success && response.carteiras) {
+            const carteirasAtivas = response.carteiras.filter((c: any) => c.ativo);
+            setCarteiras(carteirasAtivas);
+            
+            // Encontra a carteira padrão
+            const padrao = carteirasAtivas.find((c: any) => c.padrao);
+            if (padrao) {
+              setCarteiraPadrao(padrao.id);
+              setFormData(prev => ({ ...prev, carteiraId: padrao.id }));
+            } else if (carteirasAtivas.length > 0) {
+              // Se não houver padrão, usa a primeira
+              setCarteiraPadrao(carteirasAtivas[0].id);
+              setFormData(prev => ({ ...prev, carteiraId: carteirasAtivas[0].id }));
+            }
+          }
+        } catch (error) {
+          // Erro silencioso
+        }
+      };
+      carregarCarteiras();
+    }
+  }, [isOpen]);
+
+  // Função para converter dataHora do backend (pt-BR) para datetime-local
+  const converterDataHoraParaInput = (dataHora: string): string => {
+    try {
+      // Tenta parsear o formato pt-BR: "DD/MM/YYYY, HH:mm:ss" ou "DD/MM/YYYY, HH:mm"
+      const partes = dataHora.split(', ');
+      if (partes.length === 2) {
+        const [data, hora] = partes;
+        const [dia, mes, ano] = data.split('/');
+        const [h, m] = hora.split(':');
+        return `${ano}-${mes.padStart(2, '0')}-${dia.padStart(2, '0')}T${h.padStart(2, '0')}:${m.padStart(2, '0')}`;
+      }
+      // Fallback: tenta parsear como ISO
+      const date = new Date(dataHora);
+      if (!isNaN(date.getTime())) {
+        const ano = date.getFullYear();
+        const mes = String(date.getMonth() + 1).padStart(2, '0');
+        const dia = String(date.getDate()).padStart(2, '0');
+        const hora = String(date.getHours()).padStart(2, '0');
+        const minuto = String(date.getMinutes()).padStart(2, '0');
+        return `${ano}-${mes}-${dia}T${hora}:${minuto}`;
+      }
+    } catch (e) {
+      // Se falhar, retorna data/hora atual
+    }
+    return getDataHoraAtual();
+  };
+
+  useEffect(() => {
+    if (isOpen) {
+      if (transacaoEditar) {
+        // Modo edição: carrega dados da transação
+        setFormData({
+          descricao: transacaoEditar.descricao || '',
+          valor: arredondarParaCentavos(transacaoEditar.valor),
+          categoria: transacaoEditar.categoria || 'outros',
+          tipo: transacaoEditar.tipo || 'saida',
+          metodo: transacaoEditar.metodo || 'debito',
+          dataHora: transacaoEditar.dataHora ? converterDataHoraParaInput(transacaoEditar.dataHora) : getDataHoraAtual(),
+          carteiraId: transacaoEditar.carteira?.id || carteiraPadrao,
+        });
+      } else {
+        // Modo criação: reset form quando o modal abre
+        const categoriaPadrao = categorias && categorias.length > 0 && categorias.includes('outros') 
+          ? 'outros' 
+          : (categorias && categorias.length > 0 ? categorias[0] : 'outros');
+        
+        setFormData({
+          descricao: '',
+          valor: 0,
+          categoria: categoriaPadrao,
+          tipo: 'saida',
+          metodo: 'debito',
+          dataHora: getDataHoraAtual(),
+          carteiraId: carteiraPadrao,
+        });
+      }
+    }
+  }, [isOpen, categorias, transacaoEditar]);
+
+  // Não precisa de event listener adicional - o CurrencyInput já gerencia a digitação começando pelos centavos
+  // quando o value é undefined (campo vazio)
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    
+    // Validações no frontend
+    if (!formData.descricao.trim()) {
+      showError('Descrição é obrigatória');
+      return;
+    }
+    
+    if (formData.descricao.trim().length > 500) {
+      showError('Descrição muito longa. Máximo: 500 caracteres');
+      return;
+    }
+    
+    const valor = arredondarParaCentavos(formData.valor);
+    if (!valor || isNaN(valor) || valor <= 0) {
+      showError('Valor inválido. Deve ser maior que zero');
+      return;
+    }
+    
+    if (valor < 0.01) {
+      showError('Valor mínimo permitido: R$ 0,01');
+      return;
+    }
+    
+    if (valor > 10000000) {
+      showError('Valor muito alto. Máximo permitido: R$ 10.000.000,00');
+      return;
+    }
+    
+    // Validação: entrada não pode ser em crédito
+    if (formData.tipo === 'entrada' && formData.metodo === 'credito') {
+      showError('Recebimentos não podem ser em crédito');
+      return;
+    }
+    
+    // Validação: data não pode ser futura (exceto em edição)
+    if (!transacaoEditar) {
+      const dataTransacao = new Date(formData.dataHora);
+      const hoje = new Date();
+      hoje.setHours(0, 0, 0, 0);
+      const dataTransacaoSemHora = new Date(dataTransacao);
+      dataTransacaoSemHora.setHours(0, 0, 0, 0);
+      
+      if (dataTransacaoSemHora > hoje) {
+        showError('Não é possível criar transações com data futura. Use agendamentos para isso.');
+        return;
+      }
+    }
+
+    setLoading(true);
+    try {
+      // Converte dataHora do formato datetime-local para formato pt-BR (igual WhatsApp)
+      const dataHoraFormatada = formatarDataHoraParaBackend(formData.dataHora);
+      // Extrai apenas a data (YYYY-MM-DD) da dataHora
+      const dataFormatada = formData.dataHora ? formData.dataHora.split('T')[0] : new Date().toISOString().split('T')[0];
+      
+      const dadosTransacao = {
+        descricao: formData.descricao.trim(),
+        valor: valor,
+        categoria: formData.categoria,
+        tipo: formData.tipo,
+        metodo: formData.metodo,
+        data: dataFormatada,
+        dataHora: dataHoraFormatada,
+        carteiraId: formData.carteiraId,
+      };
+      
+      if (transacaoEditar?.id) {
+        // Modo edição
+        await api.atualizarTransacao(transacaoEditar.id, dadosTransacao);
+        showSuccess('Transação atualizada com sucesso!');
+      } else {
+        // Modo criação
+        await api.criarTransacao(dadosTransacao);
+        showSuccess('Transação criada com sucesso!');
+      }
+      
+      // Aguarda um pouco antes de chamar onSuccess para garantir que o backend processou
+      await new Promise(resolve => setTimeout(resolve, 300));
+      
+      onSuccess();
+      onClose();
+    } catch (error: any) {
+      showError(error.message || (transacaoEditar ? 'Erro ao atualizar transação' : 'Erro ao criar transação'));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <AnimatePresence>
+      {isOpen && (
+        <>
+          {/* Overlay */}
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={onClose}
+            className="fixed inset-0 bg-black/50 z-40"
+          />
+          
+          {/* Modal */}
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95, y: 20 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.95, y: 20 }}
+            className={`fixed inset-0 z-50 flex items-center justify-center p-4`}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div
+              className={`w-full max-w-md rounded-xl shadow-xl ${
+                isDark ? 'bg-slate-800' : 'bg-white'
+              }`}
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* Header */}
+              <div
+                className={`flex items-center justify-between p-6 border-b ${
+                  isDark ? 'border-slate-700' : 'border-slate-200'
+                }`}
+              >
+                <h2
+                  className={`text-xl font-bold ${
+                    isDark ? 'text-white' : 'text-slate-900'
+                  }`}
+                >
+                  {transacaoEditar ? 'Editar Transação' : 'Nova Transação'}
+                </h2>
+                <button
+                  onClick={onClose}
+                  className={`p-2 rounded-lg transition-colors ${
+                    isDark
+                      ? 'hover:bg-slate-700 text-slate-300'
+                      : 'hover:bg-slate-100 text-slate-600'
+                  }`}
+                >
+                  <FaTimes size={20} />
+                </button>
+              </div>
+
+              {/* Form */}
+              <form onSubmit={handleSubmit} className="p-6 space-y-4">
+                {/* Descrição */}
+                <div>
+                  <label
+                    className={`block text-sm font-medium mb-2 ${
+                      isDark ? 'text-slate-300' : 'text-slate-700'
+                    }`}
+                  >
+                    Descrição *
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.descricao}
+                    onChange={(e) =>
+                      setFormData({ ...formData, descricao: e.target.value })
+                    }
+                    required
+                    className={`w-full px-4 py-2 rounded-lg border focus:ring-2 focus:ring-primary-500 focus:border-transparent ${
+                      isDark
+                        ? 'border-slate-600 bg-slate-700 text-white'
+                        : 'border-slate-300 bg-white text-slate-900'
+                    }`}
+                    placeholder="Ex: Compra no supermercado"
+                  />
+                </div>
+
+                {/* Valor */}
+                <div>
+                  <label
+                    className={`block text-sm font-medium mb-2 ${
+                      isDark ? 'text-slate-300' : 'text-slate-700'
+                    }`}
+                  >
+                    Valor (R$) *
+                  </label>
+                  <CurrencyInputCustom
+                    id="valor-input"
+                    name="valor"
+                    value={formData.valor}
+                    onChange={handleValorChange}
+                    placeholder="R$ 0,00"
+                    required
+                    className={`w-full px-4 py-2 rounded-lg border focus:ring-2 focus:ring-primary-500 focus:border-transparent ${
+                      isDark
+                        ? 'border-slate-600 bg-slate-700 text-white'
+                        : 'border-slate-300 bg-white text-slate-900'
+                    }`}
+                  />
+                </div>
+
+                {/* Tipo e Método */}
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label
+                      className={`block text-sm font-medium mb-2 ${
+                        isDark ? 'text-slate-300' : 'text-slate-700'
+                      }`}
+                    >
+                      Tipo *
+                    </label>
+                    <select
+                      value={formData.tipo}
+                      onChange={(e) =>
+                        setFormData({
+                          ...formData,
+                          tipo: e.target.value as 'entrada' | 'saida',
+                        })
+                      }
+                      required
+                      className={`w-full px-4 py-2 rounded-lg border focus:ring-2 focus:ring-primary-500 focus:border-transparent ${
+                        isDark
+                          ? 'border-slate-600 bg-slate-700 text-white'
+                          : 'border-slate-300 bg-white text-slate-900'
+                      }`}
+                    >
+                      <option value="entrada">Entrada</option>
+                      <option value="saida">Saída</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label
+                      className={`block text-sm font-medium mb-2 ${
+                        isDark ? 'text-slate-300' : 'text-slate-700'
+                      }`}
+                    >
+                      Método *
+                    </label>
+                    <select
+                      value={formData.metodo}
+                      onChange={(e) =>
+                        setFormData({
+                          ...formData,
+                          metodo: e.target.value as 'credito' | 'debito',
+                        })
+                      }
+                      required
+                      className={`w-full px-4 py-2 rounded-lg border focus:ring-2 focus:ring-primary-500 focus:border-transparent ${
+                        isDark
+                          ? 'border-slate-600 bg-slate-700 text-white'
+                          : 'border-slate-300 bg-white text-slate-900'
+                      }`}
+                    >
+                      <option value="debito">Débito</option>
+                      <option value="credito">Crédito</option>
+                    </select>
+                  </div>
+                </div>
+
+                {/* Categoria */}
+                <div>
+                  <label
+                    className={`block text-sm font-medium mb-2 ${
+                      isDark ? 'text-slate-300' : 'text-slate-700'
+                    }`}
+                  >
+                    Categoria
+                  </label>
+                  <select
+                    value={formData.categoria}
+                    onChange={(e) =>
+                      setFormData({ ...formData, categoria: e.target.value })
+                    }
+                    className={`w-full px-4 py-2 rounded-lg border focus:ring-2 focus:ring-primary-500 focus:border-transparent ${
+                      isDark
+                        ? 'border-slate-600 bg-slate-700 text-white'
+                        : 'border-slate-300 bg-white text-slate-900'
+                    }`}
+                  >
+                    {categorias && categorias.length > 0 ? (
+                      categorias.map((cat) => (
+                        <option key={cat} value={cat}>
+                          {cat.charAt(0).toUpperCase() + cat.slice(1)}
+                        </option>
+                      ))
+                    ) : (
+                      <option value="outros">Outros</option>
+                    )}
+                  </select>
+                </div>
+
+                {/* Carteira */}
+                {carteiras.length > 0 && (
+                  <div>
+                    <label
+                      className={`block text-sm font-medium mb-2 ${
+                        isDark ? 'text-slate-300' : 'text-slate-700'
+                      }`}
+                    >
+                      Carteira
+                    </label>
+                    <select
+                      value={formData.carteiraId || ''}
+                      onChange={(e) =>
+                        setFormData({ ...formData, carteiraId: e.target.value ? parseInt(e.target.value) : null })
+                      }
+                      className={`w-full px-4 py-2 rounded-lg border focus:ring-2 focus:ring-primary-500 focus:border-transparent ${
+                        isDark
+                          ? 'border-slate-600 bg-slate-700 text-white'
+                          : 'border-slate-300 bg-white text-slate-900'
+                      }`}
+                    >
+                      {carteiras.map((carteira) => (
+                        <option key={carteira.id} value={carteira.id}>
+                          {carteira.nome} {carteira.padrao ? '(Padrão)' : ''}
+                        </option>
+                      ))}
+                    </select>
+                    <p className={`text-xs mt-1 ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+                      Se não selecionar, será usada a carteira padrão
+                    </p>
+                  </div>
+                )}
+
+                {/* Data e Hora */}
+                <div>
+                  <label
+                    className={`block text-sm font-medium mb-2 ${
+                      isDark ? 'text-slate-300' : 'text-slate-700'
+                    }`}
+                  >
+                    Data e Hora
+                  </label>
+                  <input
+                    type="datetime-local"
+                    value={formData.dataHora}
+                    onChange={(e) =>
+                      setFormData({ ...formData, dataHora: e.target.value })
+                    }
+                    className={`w-full px-4 py-2 rounded-lg border focus:ring-2 focus:ring-primary-500 focus:border-transparent ${
+                      isDark
+                        ? 'border-slate-600 bg-slate-700 text-white'
+                        : 'border-slate-300 bg-white text-slate-900'
+                    }`}
+                    style={isDark ? {} : { colorScheme: 'light' }}
+                  />
+                  <p className={`text-xs mt-1 ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+                    Padrão: data e hora atual
+                  </p>
+                </div>
+
+                {/* Actions */}
+                <div className="flex gap-3 pt-4">
+                  <button
+                    type="button"
+                    onClick={onClose}
+                    className={`flex-1 px-4 py-2 rounded-lg font-medium transition-colors ${
+                      isDark
+                        ? 'bg-slate-700 hover:bg-slate-600 text-slate-300'
+                        : 'bg-slate-200 hover:bg-slate-300 text-slate-700'
+                    }`}
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={loading}
+                    className={`flex-1 px-4 py-2 rounded-lg font-medium text-white transition-colors flex items-center justify-center gap-2 ${
+                      loading
+                        ? 'bg-slate-400 cursor-not-allowed'
+                        : isDark
+                        ? 'bg-primary-500 hover:bg-primary-600'
+                        : 'bg-primary-600 hover:bg-primary-700'
+                    }`}
+                  >
+                    {loading ? (
+                      <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                    ) : (
+                      <>
+                        {transacaoEditar ? (
+                          'Salvar'
+                        ) : (
+                          <>
+                            <FaPlus size={14} />
+                            Criar
+                          </>
+                        )}
+                      </>
+                    )}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </motion.div>
+        </>
+      )}
+    </AnimatePresence>
+  );
+}
