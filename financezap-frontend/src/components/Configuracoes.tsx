@@ -39,6 +39,14 @@ interface Plano {
   color: string;
 }
 
+interface VersionInfo {
+  version: string;
+  commit: string;
+  commitDate: string;
+  buildDate: string;
+  environment: string;
+}
+
 const PLANOS: Plano[] = [
   {
     id: 'mensal',
@@ -113,7 +121,7 @@ export function Configuracoes({ isOpen, onClose }: ConfiguracoesProps) {
   const [mostrarConfirmacaoExclusao, setMostrarConfirmacaoExclusao] = useState(false);
   const [modalPagamentoAberto, setModalPagamentoAberto] = useState(false);
   const [planoSelecionado, setPlanoSelecionado] = useState<Plano | null>(null);
-  const [versionInfo, setVersionInfo] = useState<any>(null);
+  const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
   
 
   // Atualiza os estados quando o usuário muda ou quando o modal abre
@@ -712,7 +720,7 @@ export function Configuracoes({ isOpen, onClose }: ConfiguracoesProps) {
                             Commit:
                           </span>
                           <span className={`font-mono text-xs ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>
-                            {versionInfo.commit.substring(0, 7)}
+                            {versionInfo.commit?.substring(0, 7) || 'unknown'}
                           </span>
                         </div>
                         <div className="flex justify-between">
