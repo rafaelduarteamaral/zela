@@ -723,7 +723,9 @@ export function Configuracoes({ isOpen, onClose }: ConfiguracoesProps) {
                             Commit:
                           </span>
                           <span className={`font-mono text-xs ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>
-                            {versionInfo.commit?.substring(0, 7) || 'unknown'}
+                            {versionInfo.commit && versionInfo.commit !== 'unknown' 
+                              ? versionInfo.commit.substring(0, 7) 
+                              : 'unknown'}
                           </span>
                         </div>
                         <div className="flex justify-between">
