@@ -149,7 +149,10 @@ export function Configuracoes({ isOpen, onClose }: ConfiguracoesProps) {
           const version = await api.buscarVersao();
           setVersionInfo(version);
         } catch (error) {
-          // Erro silencioso - não é crítico
+          // Erro silencioso - não é crítico, mas registra para debug
+          if (process.env.NODE_ENV === 'development') {
+            console.debug('Erro ao carregar informações de versão:', error);
+          }
         }
       };
       
