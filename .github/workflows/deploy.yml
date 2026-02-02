@@ -31,10 +31,10 @@ jobs:
       - name: Set git commit information
         id: git_info
         run: |
-          echo "GIT_COMMIT_HASH=$(git rev-parse HEAD)" >> $GITHUB_ENV
-          echo "GIT_COMMIT_DATE=$(git log -1 --format=%aI)" >> $GITHUB_ENV
+          echo "GIT_COMMIT_HASH=$(git rev-parse HEAD 2>/dev/null || echo '${{ github.sha }}')" >> $GITHUB_ENV
+          echo "GIT_COMMIT_DATE=$(git log -1 --format=%aI 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")" >> $GITHUB_ENV
           echo "BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> $GITHUB_ENV
-          echo "APP_VERSION=$(git describe --tags --always)" >> $GITHUB_ENV
+          echo "APP_VERSION=$(git describe --tags --always 2>/dev/null || echo '1.0.0')" >> $GITHUB_ENV
 
       - name: Backend | Install dependencies
         working-directory: financezap-backend
