@@ -29,41 +29,51 @@ jobs:
           cache: 'npm'
 
       - name: Backend | Install dependencies
-        run: npm ci
-        working-directory: financezap-backend
+        run: |
+          cd financezap-backend
+          npm ci
 
       - name: Backend | Run tests
-        run: npm run test:ci
-        working-directory: financezap-backend
+        run: |
+          cd financezap-backend
+          npm run test:ci
 
       - name: Backend | Build worker
-        run: npm run build:skip-tests
-        working-directory: financezap-backend
+        run: |
+          cd financezap-backend
+          npm run build:skip-tests
 
       - name: Backend | Deploy Cloudflare Worker
-        run: npm run deploy:worker
-        working-directory: financezap-backend
+        run: |
+          cd financezap-backend
+          npm run deploy:worker
 
       - name: Frontend | Install dependencies
-        run: npm ci
-        working-directory: financezap-frontend
+        run: |
+          cd financezap-frontend
+          npm ci
 
       - name: Frontend | Build
-        run: npm run build
-        working-directory: financezap-frontend
+        run: |
+          cd financezap-frontend
+          npm run build
 
       - name: Frontend | Deploy Cloudflare Pages
-        run: npx wrangler pages deploy dist --project-name "${{ env.CF_PAGES_PROJECT_FRONTEND }}"
-        working-directory: financezap-frontend
+        run: |
+          cd financezap-frontend
+          npx wrangler pages deploy dist --project-name "${{ env.CF_PAGES_PROJECT_FRONTEND }}"
 
       - name: Landing | Install dependencies
-        run: npm ci
-        working-directory: financezap-landing
+        run: |
+          cd financezap-landing
+          npm ci
 
       - name: Landing | Build
-        run: npm run build
-        working-directory: financezap-landing
+        run: |
+          cd financezap-landing
+          npm run build
 
       - name: Landing | Deploy Cloudflare Pages
-        run: npx wrangler pages deploy dist --project-name "${{ env.CF_PAGES_PROJECT_LANDING }}"
-        working-directory: financezap-landing
+        run: |
+          cd financezap-landing
+          npx wrangler pages deploy dist --project-name "${{ env.CF_PAGES_PROJECT_LANDING }}"
