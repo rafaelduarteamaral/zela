@@ -28,6 +28,14 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
+      - name: Set git commit information
+        id: git_info
+        run: |
+          echo "GIT_COMMIT_HASH=$(git rev-parse HEAD)" >> $GITHUB_ENV
+          echo "GIT_COMMIT_DATE=$(git log -1 --format=%aI)" >> $GITHUB_ENV
+          echo "BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> $GITHUB_ENV
+          echo "APP_VERSION=${{ github.ref_name }}-$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
       - name: Backend | Install dependencies
         working-directory: financezap-backend
         run: npm ci
@@ -38,6 +46,11 @@ jobs:
 
       - name: Backend | Build worker
         working-directory: financezap-backend
+        env:
+          GIT_COMMIT_HASH: ${{ env.GIT_COMMIT_HASH }}
+          GIT_COMMIT_DATE: ${{ env.GIT_COMMIT_DATE }}
+          BUILD_DATE: ${{ env.BUILD_DATE }}
+          APP_VERSION: ${{ env.APP_VERSION }}
         run: npm run build:skip-tests
 
       - name: Backend | Deploy Cloudflare Worker
@@ -50,6 +63,11 @@ jobs:
 
       - name: Frontend | Build
         working-directory: financezap-frontend
+        env:
+          VITE_GIT_COMMIT_HASH: ${{ env.GIT_COMMIT_HASH }}
+          VITE_GIT_COMMIT_DATE: ${{ env.GIT_COMMIT_DATE }}
+          VITE_BUILD_DATE: ${{ env.BUILD_DATE }}
+          VITE_APP_VERSION: ${{ env.APP_VERSION }}
         run: npm run build
 
       - name: Frontend | Deploy Cloudflare Pages
