@@ -4101,8 +4101,8 @@ app.get('/api/version', (req, res) => {
   res.json({
     version: process.env.APP_VERSION || '1.0.0',
     commit: process.env.GIT_COMMIT_HASH || 'unknown',
-    commitDate: process.env.GIT_COMMIT_DATE || new Date().toISOString(),
-    buildDate: process.env.BUILD_DATE || new Date().toISOString(),
+    commitDate: process.env.GIT_COMMIT_DATE || 'unknown',
+    buildDate: process.env.BUILD_DATE || 'unknown',
     environment: process.env.NODE_ENV || 'development'
   });
 });
