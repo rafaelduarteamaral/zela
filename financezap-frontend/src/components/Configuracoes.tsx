@@ -728,13 +728,19 @@ export function Configuracoes({ isOpen, onClose }: ConfiguracoesProps) {
                             Última atualização:
                           </span>
                           <span className={`text-xs ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>
-                            {new Date(versionInfo.commitDate).toLocaleDateString('pt-BR', {
-                              day: '2-digit',
-                              month: '2-digit',
-                              year: 'numeric',
-                              hour: '2-digit',
-                              minute: '2-digit'
-                            })}
+                            {versionInfo.commitDate ? (() => {
+                              try {
+                                return new Date(versionInfo.commitDate).toLocaleDateString('pt-BR', {
+                                  day: '2-digit',
+                                  month: '2-digit',
+                                  year: 'numeric',
+                                  hour: '2-digit',
+                                  minute: '2-digit'
+                                });
+                              } catch {
+                                return 'Data inválida';
+                              }
+                            })() : 'Não disponível'}
                           </span>
                         </div>
                         <div className="flex justify-between">
