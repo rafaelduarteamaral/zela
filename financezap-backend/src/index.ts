@@ -4096,6 +4096,17 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Rota de versão e informações do commit
+app.get('/api/version', (req, res) => {
+  res.json({
+    version: process.env.APP_VERSION || '1.0.0',
+    commit: process.env.GIT_COMMIT_HASH || 'unknown',
+    commitDate: process.env.GIT_COMMIT_DATE || new Date().toISOString(),
+    buildDate: process.env.BUILD_DATE || new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'development'
+  });
+});
+
 // Rota de teste para SSE
 app.get('/test-sse', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');

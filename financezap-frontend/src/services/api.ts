@@ -1218,4 +1218,19 @@ export const api = {
     const data = await response.json();
     return data;
   },
+
+  // Buscar informações de versão e commit
+  async buscarVersao() {
+    const response = await fetch(`${API_BASE_URL}/api/version`, {
+      method: 'GET',
+    });
+    
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.error || `Erro ${response.status}: ${response.statusText}`);
+    }
+    
+    const data = await response.json();
+    return data;
+  },
 };
