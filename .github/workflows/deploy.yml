@@ -73,9 +73,17 @@ jobs:
         working-directory: financezap-backend
         run: npm ci
 
+      - name: Backend | Generate Prisma client
+        working-directory: financezap-backend
+        run: npx prisma generate
+        env:
+          DATABASE_URL: file:../database.sqlite
+
       - name: Backend | Run tests
         working-directory: financezap-backend
         run: npm run test:ci
+        env:
+          DATABASE_URL: file:../database.sqlite
 
       - name: Backend | Build worker
         working-directory: financezap-backend

@@ -109,7 +109,7 @@ describe('API de Agendamentos', () => {
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
-      expect(response.body.agendamento).toBeDefined();
+      expect(response.body.agendamentos).toBeDefined();
     });
 
     it('deve retornar erro se descrição não for fornecida', async () => {
