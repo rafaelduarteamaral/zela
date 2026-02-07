@@ -73,6 +73,10 @@ jobs:
         working-directory: financezap-backend
         run: npm ci
 
+      - name: Backend | Generate Prisma client
+        working-directory: financezap-backend
+        run: npx prisma generate
+
       - name: Backend | Run tests
         working-directory: financezap-backend
         run: npm run test:ci

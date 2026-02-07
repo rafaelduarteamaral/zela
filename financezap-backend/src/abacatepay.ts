@@ -51,7 +51,7 @@ export async function criarCobrancaAbacatePay(input: {
     throw new Error(`Abacate Pay retornou ${response.status}: ${errorText}`);
   }
 
-  const data = await response.json();
+  const data: any = await response.json();
   return {
     id: data?.data?.id || data?.id,
     url: data?.data?.url || data?.url,
@@ -72,7 +72,7 @@ export async function buscarCobrancaAbacatePay(billingId: string): Promise<Billi
     throw new Error(`Não foi possível buscar cobrança ${billingId}: ${errorText}`);
   }
 
-  const data = await response.json();
+  const data: any = await response.json();
   const billing = data?.data || data;
 
   return {
