@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - 'claude/**'
   pull_request:
     branches:
       - main
@@ -38,7 +39,11 @@ jobs:
       - name: Generate Prisma client
         working-directory: financezap-backend
         run: npx prisma generate
+        env:
+          DATABASE_URL: file:../database.sqlite
 
       - name: Run tests
         working-directory: financezap-backend
         run: npm run test:ci
+        env:
+          DATABASE_URL: file:../database.sqlite
