@@ -6,12 +6,16 @@ on:
       - main
   workflow_dispatch:
 
+# Evita deploys concorrentes na main
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 env:
   NODE_ENV: production
-  CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-  CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-  CF_PAGES_PROJECT_FRONTEND: ${{ secrets.CF_PAGES_PROJECT_FRONTEND || 'financezap-frontend' }}
-  CF_PAGES_PROJECT_LANDING: ${{ secrets.CF_PAGES_PROJECT_LANDING || 'zela-landing' }}
 
 jobs:
   deploy:
@@ -27,14 +31,43 @@ jobs:
         with:
           node-version: '20'
           cache: 'npm'
+          cache-dependency-path: |
+            financezap-backend/package-lock.json
+            financezap-frontend/package-lock.json
+            financezap-landing/package-lock.json
+
+      - name: Validate required secrets
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          if [ -z "${CF_API_TOKEN}" ]; then
+            echo "Missing required secret: CF_API_TOKEN" >&2
+            exit 1
+          fi
+          if [ -z "${CF_ACCOUNT_ID}" ]; then
+            echo "Missing required secret: CF_ACCOUNT_ID" >&2
+            exit 1
+          fi
+
+      - name: Set Cloudflare variables
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_PAGES_PROJECT_FRONTEND: ${{ secrets.CF_PAGES_PROJECT_FRONTEND }}
+          CF_PAGES_PROJECT_LANDING: ${{ secrets.CF_PAGES_PROJECT_LANDING }}
+        run: |
+          echo "CF_API_TOKEN=${CF_API_TOKEN}" >> $GITHUB_ENV
+          echo "CF_ACCOUNT_ID=${CF_ACCOUNT_ID}" >> $GITHUB_ENV
+          echo "CF_PAGES_PROJECT_FRONTEND=${CF_PAGES_PROJECT_FRONTEND:-financezap-frontend}" >> $GITHUB_ENV
+          echo "CF_PAGES_PROJECT_LANDING=${CF_PAGES_PROJECT_LANDING:-zela-landing}" >> $GITHUB_ENV
 
       - name: Set git commit information
-        id: git_info
         run: |
-          echo "GIT_COMMIT_HASH=$(git rev-parse HEAD 2>/dev/null || echo "${{ github.sha }}")" >> $GITHUB_ENV
-          echo "GIT_COMMIT_DATE=$(git log -1 --format=%aI 2>/dev/null || echo "unknown")" >> $GITHUB_ENV
-          echo "BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> $GITHUB_ENV
-          echo "APP_VERSION=$(git describe --tags --always 2>/dev/null || echo "1.0.0")" >> $GITHUB_ENV
+          echo "GIT_COMMIT_HASH=$(git rev-parse HEAD 2>/dev/null || echo '${{ github.sha }}')" >> $GITHUB_ENV
+          echo "GIT_COMMIT_DATE=$(git log -1 --format=%aI 2>/dev/null || echo 'unknown')" >> $GITHUB_ENV
+          echo "BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_ENV
+          echo "APP_VERSION=$(git describe --tags --always 2>/dev/null || echo '1.0.0')" >> $GITHUB_ENV
 
       - name: Backend | Install dependencies
         working-directory: financezap-backend
@@ -46,11 +79,6 @@ jobs:
 
       - name: Backend | Build worker
         working-directory: financezap-backend
-        env:
-          GIT_COMMIT_HASH: ${{ env.GIT_COMMIT_HASH }}
-          GIT_COMMIT_DATE: ${{ env.GIT_COMMIT_DATE }}
-          BUILD_DATE: ${{ env.BUILD_DATE }}
-          APP_VERSION: ${{ env.APP_VERSION }}
         run: npm run build:skip-tests
 
       - name: Backend | Deploy Cloudflare Worker
@@ -63,11 +91,6 @@ jobs:
 
       - name: Frontend | Build
         working-directory: financezap-frontend
-        env:
-          VITE_GIT_COMMIT_HASH: ${{ env.GIT_COMMIT_HASH }}
-          VITE_GIT_COMMIT_DATE: ${{ env.GIT_COMMIT_DATE }}
-          VITE_BUILD_DATE: ${{ env.BUILD_DATE }}
-          VITE_APP_VERSION: ${{ env.APP_VERSION }}
         run: npm run build
 
       - name: Frontend | Deploy Cloudflare Pages
