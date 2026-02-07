@@ -1,30 +1,45 @@
-# Pipeline para Testes Unitários
+name: Run Tests
 
-Esta pipeline executa os testes unitários usando o Jest como parte do processo de CI/CD.
-
-## Passos da Pipeline
-
-1. **Instalação de Dependências**: Instalar todas as dependências do projeto utilizando o gerenciador de pacotes.
-2. **Execução de Testes**: Rodar os testes unitários utilizando Jest.
-3. **Relatório de Testes**: Exibir os resultados dos testes na estrutura de CI/CD.
-
-## Exemplo de Configuração da Pipeline
-
-```yaml
-name: Node.js CI
-
-on: [push]
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - 'copilot/**'
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
 
 jobs:
-  build:
+  test-backend:
+    name: Test Backend
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
-    - name: Instalar Dependências
-      run: npm install
-    - name: Rodar Testes
-      run: npm test
-```
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-Adicione esta configuração no seu arquivo de workflow para usar o Jest na execução dos testes unitários.
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: financezap-backend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: financezap-backend
+        run: npm ci
+
+      - name: Run tests
+        working-directory: financezap-backend
+        run: npm run test:ci
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: financezap-backend/coverage/
+          retention-days: 7
