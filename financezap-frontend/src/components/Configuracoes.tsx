@@ -39,6 +39,14 @@ interface Plano {
   color: string;
 }
 
+interface VersionInfo {
+  version: string;
+  commit: string;
+  commitDate: string;
+  buildDate: string;
+  environment: string;
+}
+
 const PLANOS: Plano[] = [
   {
     id: 'mensal',
@@ -113,6 +121,7 @@ export function Configuracoes({ isOpen, onClose }: ConfiguracoesProps) {
   const [mostrarConfirmacaoExclusao, setMostrarConfirmacaoExclusao] = useState(false);
   const [modalPagamentoAberto, setModalPagamentoAberto] = useState(false);
   const [planoSelecionado, setPlanoSelecionado] = useState<Plano | null>(null);
+  const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
   
 
   // Atualiza os estados quando o usuário muda ou quando o modal abre
@@ -134,7 +143,21 @@ export function Configuracoes({ isOpen, onClose }: ConfiguracoesProps) {
         }
       };
       
+      // Carrega informações de versão
+      const carregarVersao = async () => {
+        try {
+          const version = await api.buscarVersao();
+          setVersionInfo(version);
+        } catch (error) {
+          // Erro silencioso - não é crítico, mas registra para debug
+          if (process.env.NODE_ENV === 'development') {
+            console.debug('Erro ao carregar informações de versão:', error);
+          }
+        }
+      };
+      
       recarregarPerfil();
+      carregarVersao();
       
       if (usuario) {
         setNome(usuario.nome || '');
@@ -676,6 +699,67 @@ export function Configuracoes({ isOpen, onClose }: ConfiguracoesProps) {
                     </div>
                   </div>
                 </div>
+
+                {/* Informações de Versão */}
+                {versionInfo && (
+                  <div className="mt-6 pt-6 border-t border-slate-200 dark:border-slate-700">
+                    <h3 className={`text-lg font-semibold mb-4 ${isDark ? 'text-white' : 'text-slate-900'}`}>
+                      Informações da Aplicação
+                    </h3>
+                    <div className={`p-4 rounded-lg ${
+                      isDark ? 'bg-slate-700/50' : 'bg-slate-50'
+                    }`}>
+                      <div className="space-y-2 text-sm">
+                        <div className="flex justify-between">
+                          <span className={isDark ? 'text-slate-400' : 'text-slate-600'}>
+                            Versão:
+                          </span>
+                          <span className={`font-medium ${isDark ? 'text-white' : 'text-slate-900'}`}>
+                            {versionInfo.version}
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className={isDark ? 'text-slate-400' : 'text-slate-600'}>
+                            Commit:
+                          </span>
+                          <span className={`font-mono text-xs ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>
+                            {versionInfo.commit && versionInfo.commit !== 'unknown' 
+                              ? versionInfo.commit.substring(0, 7) 
+                              : 'unknown'}
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className={isDark ? 'text-slate-400' : 'text-slate-600'}>
+                            Última atualização:
+                          </span>
+                          <span className={`text-xs ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>
+                            {versionInfo.commitDate ? (() => {
+                              try {
+                                return new Date(versionInfo.commitDate).toLocaleDateString('pt-BR', {
+                                  day: '2-digit',
+                                  month: '2-digit',
+                                  year: 'numeric',
+                                  hour: '2-digit',
+                                  minute: '2-digit'
+                                });
+                              } catch {
+                                return 'Data inválida';
+                              }
+                            })() : 'Não disponível'}
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className={isDark ? 'text-slate-400' : 'text-slate-600'}>
+                            Ambiente:
+                          </span>
+                          <span className={`font-medium ${isDark ? 'text-white' : 'text-slate-900'}`}>
+                            {versionInfo.environment}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 

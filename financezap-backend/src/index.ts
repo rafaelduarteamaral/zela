@@ -109,6 +109,9 @@ import {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Versão padrão da aplicação
+const DEFAULT_APP_VERSION = '1.0.0';
+
 // Armazena mensagens recebidas em memória
 interface MensagemRecebida {
   id: string;
@@ -4093,6 +4096,17 @@ app.get('/health', (req, res) => {
     message: 'Servidor rodando',
     mensagens: mensagensRecebidas.length,
     clientesConectados: clientesSSE.length
+  });
+});
+
+// Rota de versão e informações do commit
+app.get('/api/version', (req, res) => {
+  res.json({
+    version: process.env.APP_VERSION || DEFAULT_APP_VERSION,
+    commit: process.env.GIT_COMMIT_HASH || 'unknown',
+    commitDate: process.env.GIT_COMMIT_DATE || 'unknown',
+    buildDate: process.env.BUILD_DATE || 'unknown',
+    environment: process.env.NODE_ENV || 'development'
   });
 });
 
