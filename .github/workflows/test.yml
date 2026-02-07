@@ -1,0 +1,30 @@
+# Pipeline para Testes Unitários
+
+Esta pipeline executa os testes unitários usando o Jest como parte do processo de CI/CD.
+
+## Passos da Pipeline
+
+1. **Instalação de Dependências**: Instalar todas as dependências do projeto utilizando o gerenciador de pacotes.
+2. **Execução de Testes**: Rodar os testes unitários utilizando Jest.
+3. **Relatório de Testes**: Exibir os resultados dos testes na estrutura de CI/CD.
+
+## Exemplo de Configuração da Pipeline
+
+```yaml
+name: Node.js CI
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+    - name: Instalar Dependências
+      run: npm install
+    - name: Rodar Testes
+      run: npm test
+```
+
+Adicione esta configuração no seu arquivo de workflow para usar o Jest na execução dos testes unitários.
