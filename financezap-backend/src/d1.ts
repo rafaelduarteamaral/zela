@@ -2510,16 +2510,16 @@ export async function resolverCarteiraPorTextoD1(
     }
   }
 
+  // fallback: carteira padrão tem prioridade
+  const padrao = await buscarCarteiraPadraoD1(db, telefone);
+  if (padrao) {
+    return { carteira: padrao, origem: 'carteira-padrao', score: 0.5 };
+  }
+
   // fallback: última carteira usada
   const ultima = await obterUltimaCarteiraUsadaD1(db, telefone);
   if (ultima) {
-    return { carteira: ultima, origem: 'ultima-carteira', score: 0.5 };
-  }
-
-  // fallback: carteira padrão
-  const padrao = await buscarCarteiraPadraoD1(db, telefone);
-  if (padrao) {
-    return { carteira: padrao, origem: 'carteira-padrao', score: 0.45 };
+    return { carteira: ultima, origem: 'ultima-carteira', score: 0.45 };
   }
 
   // fallback final: primeira carteira
