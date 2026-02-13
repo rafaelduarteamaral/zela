@@ -14,9 +14,6 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  NODE_ENV: production
-
 jobs:
   deploy:
     name: Build & publish frontend/backend
