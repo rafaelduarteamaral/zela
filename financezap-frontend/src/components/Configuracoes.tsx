@@ -150,7 +150,7 @@ export function Configuracoes({ isOpen, onClose }: ConfiguracoesProps) {
           setVersionInfo(version);
         } catch (error) {
           // Erro silencioso - não é crítico, mas registra para debug
-          if (process.env.NODE_ENV === 'development') {
+          if (import.meta.env.DEV) {
             console.debug('Erro ao carregar informações de versão:', error);
           }
         }
