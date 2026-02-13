@@ -4125,9 +4125,9 @@ Responda à pergunta do usuário de forma clara, prática e útil. Se for sobre 
 app.post('/webhook/zapi', async (c) => {
   try {
     // Valida Client-Token do Z-API
-    const clientToken = c.req.header('Client-Token') || c.req.header('client-token');
+    const clientToken = c.req.header('Client-Token') || c.req.header('client-token') || '';
     if (c.env.ZAPI_CLIENT_TOKEN && clientToken !== c.env.ZAPI_CLIENT_TOKEN) {
-      console.warn('Webhook Z-API rejeitado: Client-Token invalido');
+      console.warn('⚠️ Webhook Z-API rejeitado: Client-Token invalido | recebido:', clientToken ? clientToken.substring(0, 8) + '...' : 'VAZIO', '| esperado:', c.env.ZAPI_CLIENT_TOKEN ? c.env.ZAPI_CLIENT_TOKEN.substring(0, 8) + '...' : 'NAO_CONFIGURADO');
       return c.json({ success: false, error: 'Unauthorized' }, 401);
     }
 
@@ -4152,8 +4152,13 @@ app.post('/webhook/zapi', async (c) => {
     }
     
     
+    // Log do payload para debug
+    console.log('📩 Webhook Z-API recebido - type:', body.type, '| phone:', body.phone ? 'presente' : 'ausente', '| text:', JSON.stringify(body.text || null), '| audio:', body.audio ? 'presente' : 'ausente', '| isGroup:', body.isGroup);
+
     // Extrai texto da mensagem ou botão clicado
-    let messageText = body.text?.message || body.message?.text || body.message || '';
+    let rawMessage = body.text?.message || body.message?.text || body.message || '';
+    // Garante que messageText é sempre string (body.message pode ser um objeto)
+    let messageText = typeof rawMessage === 'string' ? rawMessage : '';
     
     // Verifica se é clique em botão
     const buttonId = body.buttonId || body.button?.id || body.buttonList?.button?.id;
@@ -4214,18 +4219,32 @@ app.post('/webhook/zapi', async (c) => {
     // Processa áudio se houver
     const audioUrl = body.audio?.audioUrl || body.audio?.url || body.mediaUrl;
     const audioType = body.audio?.mimeType || body.audio?.type || body.mediaType || '';
-    
-    if (audioUrl && (audioType.startsWith('audio/') || audioUrl.includes('audio'))) {
-      
+    const isAudioMessage = body.audio && (body.audio.audioUrl || body.audio.url || body.audio.ptt !== undefined);
+
+    console.log('🔊 Debug áudio - audioUrl:', audioUrl ? 'presente' : 'ausente', '| audioType:', audioType, '| isAudioMessage:', isAudioMessage, '| body.audio:', JSON.stringify(body.audio || null));
+
+    if (audioUrl && (isAudioMessage || audioType.startsWith('audio/') || audioUrl.includes('audio'))) {
+      console.log('🎤 Processando mensagem de áudio...');
+
       try {
         // Baixa o áudio
         const audioResponse = await fetch(audioUrl);
         if (!audioResponse.ok) {
           throw new Error(`Erro ao baixar áudio: ${audioResponse.status}`);
         }
-        
+
         const audioBuffer = await audioResponse.arrayBuffer();
-        const audioBase64 = btoa(String.fromCharCode(...new Uint8Array(audioBuffer)));
+        console.log('🔊 Áudio baixado, tamanho:', audioBuffer.byteLength, 'bytes');
+
+        // Converte para base64 de forma segura (sem spread operator que falha com arrays grandes)
+        const uint8Array = new Uint8Array(audioBuffer);
+        let binaryString = '';
+        const chunkSize = 8192;
+        for (let i = 0; i < uint8Array.length; i += chunkSize) {
+          const chunk = uint8Array.subarray(i, Math.min(i + chunkSize, uint8Array.length));
+          binaryString += String.fromCharCode.apply(null, Array.from(chunk));
+        }
+        const audioBase64 = btoa(binaryString);
         
         
         // Transcreve usando Gemini ou Groq (se configurado)
@@ -4236,11 +4255,14 @@ app.post('/webhook/zapi', async (c) => {
         if (geminiApiKey) {
           try {
             
-            const mimeType = audioType || 'audio/ogg';
+            // Normaliza mimeType - Gemini precisa do tipo base sem parâmetros extras
+            const rawMimeType = audioType || 'audio/ogg';
+            const mimeType = rawMimeType.split(';')[0].trim(); // Remove "; codecs=opus" etc
             const prompt = 'Transcreva este áudio para texto em português brasileiro. Retorne apenas o texto transcrito, sem explicações adicionais.';
-            
+
             // Usa modelo gratuito do Gemini
             const geminiModel = 'gemini-2.5-flash';
+            console.log('🤖 Enviando áudio para Gemini:', geminiModel, '| mimeType:', mimeType, '| base64 length:', audioBase64.length);
             
             const geminiResponse = await fetch(
               `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${geminiApiKey}`,
@@ -4281,7 +4303,8 @@ app.post('/webhook/zapi', async (c) => {
             
             const geminiData = await geminiResponse.json();
             const transcription = geminiData.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
-            
+            console.log('✅ Transcrição Gemini:', transcription ? `"${transcription.substring(0, 100)}..."` : 'VAZIA');
+
             if (transcription && transcription.length > 0) {
               messageText = transcription;
             } else {
