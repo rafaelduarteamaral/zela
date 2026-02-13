@@ -4157,7 +4157,7 @@ app.post('/webhook/zapi', async (c) => {
     
     
     // Log do payload para debug
-    console.log('📩 Webhook Z-API recebido - type:', body.type, '| phone:', body.phone ? 'presente' : 'ausente', '| text:', JSON.stringify(body.text || null), '| audio:', body.audio ? 'presente' : 'ausente', '| isGroup:', body.isGroup);
+    console.log('📩 Webhook Z-API recebido - type:', body.type, '| phone:', body.phone ? 'presente' : 'ausente', '| text:', JSON.stringify(body.text || null), '| audio:', body.audio ? 'presente' : 'ausente', '| image:', body.image ? 'presente' : 'ausente', '| isGroup:', body.isGroup);
 
     // Extrai texto da mensagem ou botão clicado
     let rawMessage = body.text?.message || body.message?.text || body.message || '';
@@ -4371,7 +4371,113 @@ app.post('/webhook/zapi', async (c) => {
         }, 400);
       }
     }
-    
+
+    // Processa imagem se houver (cupom fiscal, comprovante, etc.)
+    const imageUrl = body.image?.imageUrl || body.image?.url;
+    const imageType = body.image?.mimeType || '';
+    const imageCaption = body.image?.caption || '';
+
+    if (imageUrl && !messageText) {
+      console.log('📸 Imagem detectada - URL:', imageUrl ? 'presente' : 'ausente', '| type:', imageType, '| caption:', imageCaption || 'sem legenda');
+
+      const geminiApiKey = c.env.GEMINI_API_KEY;
+      if (geminiApiKey) {
+        try {
+          // Baixa a imagem
+          const imageResponse = await fetch(imageUrl);
+          if (!imageResponse.ok) {
+            throw new Error(`Erro ao baixar imagem: ${imageResponse.status}`);
+          }
+
+          const imageBuffer = await imageResponse.arrayBuffer();
+          console.log('📸 Imagem baixada, tamanho:', imageBuffer.byteLength, 'bytes');
+
+          // Converte para base64 de forma segura
+          const uint8Arr = new Uint8Array(imageBuffer);
+          let binStr = '';
+          const chunkSz = 8192;
+          for (let i = 0; i < uint8Arr.length; i += chunkSz) {
+            const chunk = uint8Arr.subarray(i, Math.min(i + chunkSz, uint8Arr.length));
+            binStr += String.fromCharCode.apply(null, Array.from(chunk));
+          }
+          const imageBase64 = btoa(binStr);
+
+          const mimeType = (imageType || 'image/jpeg').split(';')[0].trim();
+          const geminiModel = 'gemini-2.5-flash';
+
+          const prompt = `Analise esta imagem. Se for um cupom fiscal, nota fiscal, comprovante de pagamento ou recibo:
+- Extraia TODOS os itens com seus valores
+- Identifique o estabelecimento/loja
+- Identifique o valor total
+- Responda no formato: "Comprei [itens] no [estabelecimento] por R$ [valor total]"
+- Se houver múltiplos itens, liste cada um
+
+Se for um comprovante de transferência/Pix:
+- Extraia o valor, destinatário e tipo
+- Responda no formato: "Transferência de R$ [valor] para [destinatário]"
+
+Se a imagem não for relacionada a finanças, descreva brevemente o que vê e pergunte como pode ajudar.
+${imageCaption ? `\nLegenda enviada pelo usuário: "${imageCaption}"` : ''}`;
+
+          console.log('🤖 Enviando imagem para Gemini:', geminiModel, '| mimeType:', mimeType, '| base64 length:', imageBase64.length);
+
+          const geminiResponse = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${geminiApiKey}`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                contents: [{
+                  parts: [
+                    { text: prompt },
+                    {
+                      inlineData: {
+                        data: imageBase64,
+                        mimeType: mimeType,
+                      },
+                    },
+                  ],
+                }],
+              }),
+            }
+          );
+
+          if (!geminiResponse.ok) {
+            const errorData: any = await geminiResponse.json().catch(() => ({}));
+            console.error('❌ Erro Gemini (imagem):', JSON.stringify(errorData));
+            throw new Error(`Gemini error: ${geminiResponse.status}`);
+          }
+
+          const geminiData: any = await geminiResponse.json();
+          const extractedText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+          console.log('✅ Extração Gemini (imagem):', extractedText ? `"${extractedText.substring(0, 150)}..."` : 'VAZIA');
+
+          if (extractedText && extractedText.length > 0) {
+            messageText = extractedText;
+          } else {
+            throw new Error('IMAGE_EXTRACTION_EMPTY');
+          }
+        } catch (error: any) {
+          console.error('❌ Erro ao processar imagem:', error.message);
+          const mensagemErro = '📸 Recebi sua imagem, mas não consegui processá-la. Tente enviar uma foto mais nítida ou digite os valores manualmente.';
+          try {
+            await enviarMensagemZApi(telefoneFormatado, mensagemErro, c.env);
+          } catch (envioError: any) {
+            console.error('❌ Erro ao enviar mensagem de erro:', envioError.message);
+          }
+          return c.json({ success: false, error: 'Erro ao processar imagem' }, 400);
+        }
+      } else {
+        console.warn('⚠️ Imagem recebida mas GEMINI_API_KEY não configurada');
+        const mensagemErro = '📸 Recebi sua imagem! No momento, o processamento de imagens está sendo configurado. Por favor, digite os valores manualmente.';
+        await enviarMensagemZApi(telefoneFormatado, mensagemErro, c.env);
+        return c.json({ success: false, error: 'Gemini não configurado para imagens' }, 400);
+      }
+    } else if (imageUrl && imageCaption && !messageText) {
+      // Se tem imagem com legenda, usa a legenda como texto
+      messageText = imageCaption;
+    }
+
     if (!messageText || messageText.trim().length === 0) {
       return c.json({ success: false, error: 'message é obrigatório' }, 400);
     }
