@@ -131,16 +131,7 @@ import {
 } from './queueProcessamento';
 
 // Tipos para Cloudflare Workers
-interface D1Database {
-  prepare(query: string): D1PreparedStatement;
-}
-
-interface D1PreparedStatement {
-  bind(...values: any[]): D1PreparedStatement;
-  first<T = any>(): Promise<T | null>;
-  all<T = any>(): Promise<{ results: T[] }>;
-  run(): Promise<{ meta: { last_row_id: number; changes: number } }>;
-}
+import type { D1Database } from './d1';
 
 type Bindings = {
   financezap_db: D1Database;
@@ -245,7 +236,7 @@ async function buscarCobrancaAbacatePayWorker(env: Bindings, billingId: string) 
     throw new Error(`Erro ao consultar cobrança: ${response.status} ${text}`);
   }
 
-  const data = await response.json();
+  const data: any = await response.json();
   return data?.data || data;
 }
 
@@ -670,7 +661,7 @@ Regras:
           throw new Error(`Groq API error: ${groqResponse.status}`);
         }
 
-        const groqData = await groqResponse.json();
+        const groqData: any = await groqResponse.json();
         resposta = groqData.choices[0]?.message?.content || '{}';
       } catch (error: any) {
         if (temGemini) {
@@ -709,7 +700,7 @@ Regras:
         throw new Error(`Gemini API error: ${geminiResponse.status}`);
       }
 
-      const geminiData = await geminiResponse.json();
+      const geminiData: any = await geminiResponse.json();
       resposta = geminiData.candidates[0]?.content?.parts[0]?.text || '{}';
     } else {
       throw new Error('Nenhuma IA disponível');
@@ -810,6 +801,8 @@ async function processarAgendamentoComIA(
   dataAgendamento: string;
   tipo: 'pagamento' | 'recebimento';
   categoria?: string;
+  recorrente?: boolean;
+  totalParcelas?: number;
   sucesso: boolean;
 } | null> {
   const groqApiKey = env.GROQ_API_KEY;
@@ -879,7 +872,7 @@ Retorne APENAS o JSON, sem texto adicional.`;
       });
       
       if (groqResponse.ok) {
-        const groqData = await groqResponse.json();
+        const groqData: any = await groqResponse.json();
         const resposta = groqData.choices?.[0]?.message?.content || '';
         
         let jsonStr = resposta.trim();
@@ -951,7 +944,7 @@ Retorne APENAS o JSON, sem texto adicional.`;
       );
       
       if (geminiResponse.ok) {
-        const geminiData = await geminiResponse.json();
+        const geminiData: any = await geminiResponse.json();
         const resposta = geminiData.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
         
         let jsonStr = resposta.trim();
@@ -1207,7 +1200,7 @@ async function enviarMensagemZApiUnica(
       headers: { 
         'Content-Type': 'application/json',
         'Accept': 'application/json',
-        'Client-Token': env.ZAPI_CLIENT_TOKEN,
+        'Client-Token': env.ZAPI_CLIENT_TOKEN || '',
       },
       body: JSON.stringify({
         phone: numeroFormatado,
@@ -1296,7 +1289,7 @@ async function enviarMensagemComButtonListZApi(
       headers: { 
         'Content-Type': 'application/json',
         'Accept': 'application/json',
-        'Client-Token': env.ZAPI_CLIENT_TOKEN,
+        'Client-Token': env.ZAPI_CLIENT_TOKEN || '',
       },
       body: JSON.stringify(requestBody),
     });
