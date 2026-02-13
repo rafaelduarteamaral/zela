@@ -4239,8 +4239,8 @@ app.post('/webhook/zapi', async (c) => {
             const mimeType = audioType || 'audio/ogg';
             const prompt = 'Transcreva este áudio para texto em português brasileiro. Retorne apenas o texto transcrito, sem explicações adicionais.';
             
-            // Usa modelo compatível com tier gratuito
-            const geminiModel = 'gemini-1.5-flash'; // Modelo que funciona no tier gratuito
+            // Usa modelo gratuito do Gemini
+            const geminiModel = 'gemini-2.5-flash';
             
             const geminiResponse = await fetch(
               `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${geminiApiKey}`,
