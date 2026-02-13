@@ -6,9 +6,8 @@
     "target": "es2022",
     "lib": ["es2022"],
     "types": ["@cloudflare/workers-types"],
-    "strict": false,
     "noEmit": true
   },
-  "include": ["src/worker.ts", "src/d1.ts", "src/**/*.ts"],
+  "include": ["src/worker.ts", "src/d1.ts"],
   "exclude": ["node_modules", "dist"]
 }
