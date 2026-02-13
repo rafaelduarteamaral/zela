@@ -4124,11 +4124,15 @@ Responda à pergunta do usuário de forma clara, prática e útil. Se for sobre 
 
 app.post('/webhook/zapi', async (c) => {
   try {
-    // Valida Client-Token do Z-API
+    // Valida Client-Token do Z-API (aceita requests sem token para compatibilidade)
     const clientToken = c.req.header('Client-Token') || c.req.header('client-token') || '';
-    if (c.env.ZAPI_CLIENT_TOKEN && clientToken !== c.env.ZAPI_CLIENT_TOKEN) {
-      console.warn('⚠️ Webhook Z-API rejeitado: Client-Token invalido | recebido:', clientToken ? clientToken.substring(0, 8) + '...' : 'VAZIO', '| esperado:', c.env.ZAPI_CLIENT_TOKEN ? c.env.ZAPI_CLIENT_TOKEN.substring(0, 8) + '...' : 'NAO_CONFIGURADO');
+    if (c.env.ZAPI_CLIENT_TOKEN && clientToken && clientToken !== c.env.ZAPI_CLIENT_TOKEN) {
+      // Rejeita apenas se um token FOI enviado mas é diferente do esperado
+      console.warn('⚠️ Webhook Z-API rejeitado: Client-Token invalido | recebido:', clientToken.substring(0, 8) + '...', '| esperado:', c.env.ZAPI_CLIENT_TOKEN.substring(0, 8) + '...');
       return c.json({ success: false, error: 'Unauthorized' }, 401);
+    }
+    if (c.env.ZAPI_CLIENT_TOKEN && !clientToken) {
+      console.warn('⚠️ Webhook Z-API: Client-Token não enviado pelo Z-API (aceitando para compatibilidade)');
     }
 
     const body = await c.req.json();
