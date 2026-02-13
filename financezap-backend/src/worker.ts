@@ -130,9 +130,6 @@ import {
   marcarMensagemErro,
 } from './queueProcessamento';
 
-// Tipos para Cloudflare Workers
-import type { D1Database } from './d1';
-
 type Bindings = {
   financezap_db: D1Database;
   ALLOWED_ORIGINS?: string;
