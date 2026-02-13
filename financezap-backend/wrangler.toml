@@ -16,7 +16,7 @@ migrations_dir = "prisma/migrations"
 [vars]
 # Ajuste as origens permitidas do frontend (separadas por vírgula)
 # URLs permitidas para CORS
-ALLOWED_ORIGINS = "https://usezela.com,https://www.usezela.com,https://*.usezela.com,https://financezap-frontend.pages.dev,https://*.financezap-frontend.pages.dev,http://localhost:5173,http://localhost:3000"
+ALLOWED_ORIGINS = "https://usezela.com,https://www.usezela.com,https://*.usezela.com,https://financezap-frontend.pages.dev,https://*.financezap-frontend.pages.dev"
 
 [observability]
 enabled = false

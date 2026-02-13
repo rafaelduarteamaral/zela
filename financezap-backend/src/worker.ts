@@ -155,6 +155,50 @@ type Bindings = {
 
 const app = new Hono<{ Bindings: Bindings }>();
 
+/**
+ * Retorna o JWT secret de forma segura.
+ * Lanca erro se nao estiver configurado em producao.
+ */
+function getJwtSecret(env: Bindings): string {
+  const secret = env.JWT_SECRET;
+  if (!secret) {
+    throw new Error('JWT_SECRET nao configurado. Configure a variavel de ambiente.');
+  }
+  return secret;
+}
+
+/**
+ * Mascara telefone para logs (ex: 5511999991234 -> 5511****1234)
+ */
+function mascararTelefone(telefone: string): string {
+  const limpo = telefone.replace(/\D/g, '');
+  if (limpo.length <= 6) return '****';
+  return limpo.slice(0, 4) + '****' + limpo.slice(-4);
+}
+
+// Rate limiter simples para endpoints de auth (por IP/telefone)
+const authRateLimitMap = new Map<string, { tentativas: number; ultimaTentativa: number }>();
+const AUTH_RATE_LIMIT_MAX = 5; // max 5 tentativas
+const AUTH_RATE_LIMIT_WINDOW = 5 * 60 * 1000; // janela de 5 minutos
+
+function verificarAuthRateLimit(chave: string): boolean {
+  const agora = Date.now();
+  const info = authRateLimitMap.get(chave);
+
+  if (!info || (agora - info.ultimaTentativa) > AUTH_RATE_LIMIT_WINDOW) {
+    authRateLimitMap.set(chave, { tentativas: 1, ultimaTentativa: agora });
+    return true;
+  }
+
+  if (info.tentativas >= AUTH_RATE_LIMIT_MAX) {
+    return false; // bloqueado
+  }
+
+  info.tentativas++;
+  info.ultimaTentativa = agora;
+  return true;
+}
+
 // Armazena clientes SSE conectados (por telefone)
 const clientesSSE = new Map<string, ReadableStreamDefaultController[]>();
 
@@ -365,24 +409,20 @@ app.use(
   cors({
     origin: (origin, c) => {
       const allowed = parseAllowedOrigins(c.env.ALLOWED_ORIGINS);
-      
-      // Permite webhooks do Z-API (sem origem ou de api.z-api.io)
-      if (!origin || origin.includes('z-api.io')) {
-        return origin || '*';
-      }
-      
-      // Se não há origem (ex: requisição do mesmo domínio), permite
+
+      // Webhooks (Z-API, Twilio, AbacatePay) nao enviam Origin header
+      // Permitem server-to-server sem CORS
       if (!origin) {
-        return allowed[0] || '*';
+        return allowed[0] || 'https://usezela.com';
       }
-      
-      // Verifica se a origem está permitida
+
+      // Verifica se a origem esta na lista permitida
       if (isOriginAllowed(origin, allowed)) {
         return origin;
       }
-      
-      // Fallback: permite a primeira origem da lista ou todas
-      return allowed[0] || '*';
+
+      // Origem nao permitida - nega CORS
+      return 'https://usezela.com';
     },
     allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Cache-Control'],
@@ -1056,7 +1096,7 @@ async function autenticarMiddleware(c: any, next: () => Promise<void>): Promise<
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);
@@ -1382,7 +1422,7 @@ app.get('/api/transacoes', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     
     
     let telefoneFormatado: string;
@@ -1437,7 +1477,7 @@ app.post('/api/transacoes', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     
     let telefoneFormatado: string;
     try {
@@ -1560,7 +1600,7 @@ app.put('/api/transacoes/:id', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     
     let telefoneFormatado: string;
     try {
@@ -1723,7 +1763,7 @@ app.delete('/api/transacoes/:id', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     
     let telefoneFormatado: string;
     try {
@@ -1773,7 +1813,7 @@ app.get('/api/estatisticas', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     
     let telefoneFormatado: string;
     try {
@@ -1829,7 +1869,7 @@ app.get('/api/gastos-por-dia', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     
     let telefoneFormatado: string;
     try {
@@ -1851,12 +1891,12 @@ app.get('/api/gastos-por-dia', async (c) => {
   }
 });
 
-app.get('/api/telefones', async (c) => {
+app.get('/api/telefones', autenticarMiddleware, async (c) => {
   const telefones = await listarTelefones(c.env.financezap_db);
   return c.json({ success: true, telefones });
 });
 
-app.get('/api/resumo/:telefone', async (c) => {
+app.get('/api/resumo/:telefone', autenticarMiddleware, async (c) => {
   const telefone = c.req.param('telefone');
   const resumo = await resumoPorTelefone(c.env.financezap_db, telefone);
   return c.json({ success: true, resumo });
@@ -1867,9 +1907,14 @@ app.post('/api/auth/solicitar-codigo', async (c) => {
   try {
     const body = await c.req.json();
     const { telefone } = body;
-    
+
     if (!telefone || !telefone.trim()) {
       return c.json({ success: false, error: 'Telefone é obrigatório' }, 400);
+    }
+
+    // Rate limiting por telefone
+    if (!verificarAuthRateLimit(`auth:${telefone}`)) {
+      return c.json({ success: false, error: 'Muitas tentativas. Aguarde 5 minutos.' }, 429);
     }
     
     const telefoneFormatado = formatarTelefone(telefone);
@@ -1931,11 +1976,16 @@ app.post('/api/auth/verificar-codigo', async (c) => {
   try {
     const body = await c.req.json();
     const { telefone, codigo } = body;
-    
+
     if (!telefone || !telefone.trim()) {
       return c.json({ success: false, error: 'Telefone é obrigatório' }, 400);
     }
-    
+
+    // Rate limiting por telefone (previne brute force no codigo)
+    if (!verificarAuthRateLimit(`verify:${telefone}`)) {
+      return c.json({ success: false, error: 'Muitas tentativas. Aguarde 5 minutos.' }, 429);
+    }
+
     if (!codigo || !codigo.trim()) {
       return c.json({ success: false, error: 'Código é obrigatório' }, 400);
     }
@@ -1954,11 +2004,11 @@ app.post('/api/auth/verificar-codigo', async (c) => {
     
     // Gera token JWT usando biblioteca compatível com Workers
     // Nota: Em produção, configure JWT_SECRET no wrangler.toml ou variáveis de ambiente
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     
     
-    // Calcula expiração (7 dias = 7 * 24 * 60 * 60 segundos)
-    const expiresInSeconds = 7 * 24 * 60 * 60; // 7 dias
+    // Calcula expiração (24 horas)
+    const expiresInSeconds = 24 * 60 * 60; // 24 horas
     const exp = Math.floor(Date.now() / 1000) + expiresInSeconds;
     
     const token = await jwt.sign(
@@ -2156,7 +2206,7 @@ app.delete('/api/auth/excluir-dados', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     
     let telefoneFormatado: string;
     try {
@@ -2202,7 +2252,7 @@ app.get('/api/auth/verify', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     
     // Verifica o token
     let telefoneFormatado: string;
@@ -2267,7 +2317,7 @@ app.post('/api/payments/abacatepay/checkout', async (c) => {
     }
 
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     const telefone = await extrairTelefoneDoToken(token, jwtSecret);
     const telefoneFormatado = formatarTelefone(telefone);
 
@@ -2324,7 +2374,7 @@ app.get('/api/payments/abacatepay/status/:billingId', async (c) => {
     }
 
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     const telefone = await extrairTelefoneDoToken(token, jwtSecret);
     const telefoneFormatado = formatarTelefone(telefone);
 
@@ -2395,7 +2445,7 @@ app.put('/api/auth/perfil', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     let telefoneFormatado: string;
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);
@@ -2453,7 +2503,7 @@ app.post('/api/auth/enviar-contato', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     let telefoneFormatado: string;
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);
@@ -2512,7 +2562,7 @@ app.post('/api/auth/ativar-assinatura', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     let telefoneFormatado: string;
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);
@@ -2581,7 +2631,7 @@ app.get('/api/categorias', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     let telefoneFormatado: string;
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);
@@ -2619,7 +2669,7 @@ app.post('/api/categorias', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     let telefoneFormatado: string;
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);
@@ -2671,7 +2721,7 @@ app.put('/api/categorias/:id', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     let telefoneFormatado: string;
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);
@@ -2733,7 +2783,7 @@ app.delete('/api/categorias/:id', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     let telefoneFormatado: string;
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);
@@ -2782,7 +2832,7 @@ app.get('/api/templates', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     let telefoneFormatado: string;
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);
@@ -2821,7 +2871,7 @@ app.post('/api/templates', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     let telefoneFormatado: string;
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);
@@ -2877,7 +2927,7 @@ app.put('/api/templates/:id', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     let telefoneFormatado: string;
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);
@@ -2930,7 +2980,7 @@ app.delete('/api/templates/:id', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     let telefoneFormatado: string;
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);
@@ -2957,7 +3007,7 @@ app.put('/api/templates/:id/ativar', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     let telefoneFormatado: string;
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);
@@ -3003,7 +3053,7 @@ app.get('/api/carteiras', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     let telefoneFormatado: string;
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);
@@ -3056,7 +3106,7 @@ app.post('/api/carteiras', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     let telefoneFormatado: string;
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);
@@ -3114,7 +3164,7 @@ app.put('/api/carteiras/:id', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     let telefoneFormatado: string;
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);
@@ -3169,7 +3219,7 @@ app.delete('/api/carteiras/:id', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     let telefoneFormatado: string;
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);
@@ -3210,7 +3260,7 @@ app.post('/api/carteiras/:id/padrao', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     let telefoneFormatado: string;
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);
@@ -3267,7 +3317,7 @@ app.get('/api/agendamentos', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     
     let telefoneFormatado: string;
     try {
@@ -3319,7 +3369,7 @@ app.post('/api/agendamentos', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     let telefoneFormatado: string;
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);
@@ -3407,7 +3457,7 @@ app.put('/api/agendamentos/:id', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     let telefoneFormatado: string;
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);
@@ -3573,7 +3623,7 @@ app.delete('/api/agendamentos/:id', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     let telefoneFormatado: string;
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);
@@ -3730,7 +3780,7 @@ app.post('/api/chat', autenticarMiddleware, async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     
     let telefoneFormatado: string;
     try {
@@ -4074,8 +4124,15 @@ Responda à pergunta do usuário de forma clara, prática e útil. Se for sobre 
 
 app.post('/webhook/zapi', async (c) => {
   try {
+    // Valida Client-Token do Z-API
+    const clientToken = c.req.header('Client-Token') || c.req.header('client-token');
+    if (c.env.ZAPI_CLIENT_TOKEN && clientToken !== c.env.ZAPI_CLIENT_TOKEN) {
+      console.warn('Webhook Z-API rejeitado: Client-Token invalido');
+      return c.json({ success: false, error: 'Unauthorized' }, 401);
+    }
+
     const body = await c.req.json();
-    
+
     // Extrai dados da mensagem
     const phoneNumber = body.isGroup ? body.participantPhone : body.phone;
     if (!phoneNumber) {
@@ -4117,7 +4174,7 @@ app.post('/webhook/zapi', async (c) => {
               return c.json({ success: false, error: 'Usuário não encontrado' }, 401);
             }
             
-            const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+            const jwtSecret = getJwtSecret(c.env);
             const token = await jwt.sign({ telefone: telefoneFormatado }, jwtSecret);
             
             // Chama endpoint de exclusão
@@ -4571,7 +4628,7 @@ app.post('/webhook/zapi', async (c) => {
     //       try {
     //         const usuario = await buscarUsuarioPorTelefone(c.env.financezap_db, cleanFromNumber);
     //         if (usuario) {
-    //           const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    //           const jwtSecret = getJwtSecret(c.env);
     //           token = await jwt.sign({ telefone: telefoneFormatado }, jwtSecret);
     //         }
     //       } catch (error: any) {
@@ -5321,7 +5378,7 @@ app.post('/webhook/zapi', async (c) => {
 
 // Scheduled handler para notificações automáticas de agendamentos
 // Endpoints de administração e monitoramento
-app.get('/api/admin/metricas', async (c) => {
+app.get('/api/admin/metricas', autenticarMiddleware, async (c) => {
   try {
     const query = c.req.query();
     const telefone = query.telefone;
@@ -5339,7 +5396,7 @@ app.get('/api/admin/metricas', async (c) => {
   }
 });
 
-app.get('/api/admin/queue/stats', async (c) => {
+app.get('/api/admin/queue/stats', autenticarMiddleware, async (c) => {
   try {
     const { obterEstatisticasQueue } = await import('./queueProcessamento');
     const stats = await obterEstatisticasQueue(c.env.financezap_db);
@@ -5350,7 +5407,7 @@ app.get('/api/admin/queue/stats', async (c) => {
   }
 });
 
-app.post('/api/admin/queue/processar', async (c) => {
+app.post('/api/admin/queue/processar', autenticarMiddleware, async (c) => {
   try {
     const { obterProximaMensagemQueue, marcarMensagemProcessando, marcarMensagemConcluida, marcarMensagemErro } = await import('./queueProcessamento');
     
@@ -5386,7 +5443,7 @@ app.post('/api/relatorios/gerar', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     let telefoneFormatado: string;
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);
@@ -5539,7 +5596,7 @@ app.post('/api/relatorios/enviar-whatsapp', async (c) => {
     }
     
     const token = authHeader.substring(7);
-    const jwtSecret = c.env.JWT_SECRET || 'dev-secret-key-change-in-production';
+    const jwtSecret = getJwtSecret(c.env);
     let telefoneFormatado: string;
     try {
       const telefone = await extrairTelefoneDoToken(token, jwtSecret);

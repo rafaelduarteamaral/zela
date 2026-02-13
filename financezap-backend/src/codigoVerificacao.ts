@@ -60,7 +60,7 @@ export async function salvarCodigoVerificacao(
     expiraEm
   });
   
-  console.log(`✅ Código de verificação salvo para ${telefone}: ${codigo} (expira em 5 minutos)`);
+  console.log(`✅ Código de verificação salvo para ${telefone.slice(0, 4)}**** (expira em 5 minutos)`);
 }
 
 /**
@@ -130,7 +130,7 @@ export async function verificarCodigo(
         
         // Verifica se o código está correto
         if (codigoSalvoCorrigido.codigo !== codigoNormalizado) {
-          console.log(`❌ Código incorreto para ${telefone}. Esperado: "${codigoSalvoCorrigido.codigo}", Recebido: "${codigoNormalizado}"`);
+          console.log(`❌ Código incorreto para ${telefone.slice(0, 4)}****`);
           return false;
         }
         
